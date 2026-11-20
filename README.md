@@ -30,7 +30,7 @@
 
 | 方式 | 说明 |
 |---|---|
-| 浏览器 | 手机/电脑连 C-RID 的热点，打开 <https://192.168.4.1>（**是 https**，80 端口只做跳转） |
+| 浏览器 | 手机/电脑连 C-RID 的热点（名字以 `ESP32-CRID-` 开头），打开 <https://192.168.4.1>（**是 https**，80 端口只做跳转）。**默认 WiFi 密码请到我的项目说明里查看**：[esp32-ChinaRemoteID_Scan_Sim](https://github.com/sd1471123/esp32-ChinaRemoteID_Scan_Sim) |
 | Android | [esp32-ChinaRemoteID_Scan_Sim](https://github.com/sd1471123/esp32-ChinaRemoteID_Scan_Sim) 仓库的 `android/` 目录（APK 也在它的 Releases 里）。BLE 优先，没连蓝牙时回落到热点 HTTPS；**OTA 升级必须连热点**，BLE 传不动 1.3 MB 的固件 |
 
 ## 界面预览
