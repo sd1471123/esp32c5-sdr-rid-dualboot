@@ -7,6 +7,28 @@
 
 两套功能各自是**独立编译的 app 镜像**，运行时互不加载、互不干扰；只在每次开机时做一次选择。
 
+## 界面预览
+
+![八个页面总览](docs/screens/overview.png)
+
+上面是**模拟渲染**图，不是相机拍屏：像素由固件自己的字库（`font5x7` / `font7x12`）和页面里写死的坐标逐个画出来，所以字号、行距、每行能塞多少字、灰阶配色都与实物一致，只是没有 IPS 视角、背光溢出这类光学效果。这样也方便改了 UI 之后重新出图对照。
+
+| 页面 | 截图 |
+|---|---|
+| 开机菜单（`←`/`B` 进 SDR，`→`/`M` 进 C-RID） | [`01-boot-menu.png`](docs/screens/01-boot-menu.png) |
+| SDR 频谱：状态栏 + 频谱 + 瀑布 + 信道条 | [`02-sdr-spectrum.png`](docs/screens/02-sdr-spectrum.png) |
+| C-RID 状态页（参数总览） | [`03-rid-status.png`](docs/screens/03-rid-status.png) |
+| C-RID 接收目标列表 | [`04-rid-targets.png`](docs/screens/04-rid-targets.png) |
+| 目标详情（12 行字段，只刷数值） | [`05-rid-detail.png`](docs/screens/05-rid-detail.png) |
+| 配置列表 / 编辑项 | [`06-rid-config.png`](docs/screens/06-rid-config.png) · [`07-rid-edit.png`](docs/screens/07-rid-edit.png) |
+| 关于页（版本 / 分区 / 背光档位） | [`08-rid-about.png`](docs/screens/08-rid-about.png) |
+
+重新出图（每张同时输出 1× 和 2× 两版）：
+
+```bash
+python tools/make_screenshots.py --scale 2
+```
+
 ## 目录
 
 ```
@@ -18,8 +40,8 @@ C5mix/
 │   ├── panel/         共用的 ST7789 + 5 按键 + 蜂鸣器驱动（原样取自 sdr tft 分支）
 │   └── dualboot/      启动目标切换 / OTA 状态确认
 ├── partitions/        合并后的 16MB 分区表（各工程各有一份拷贝）
-├── tools/             一键构建 / 烧录脚本
-└── docs/              架构说明
+├── tools/             一键构建 / 烧录脚本、模拟截图生成（make_screenshots.py）
+└── docs/              架构说明；docs/screens/ 是 README 用的模拟截图
 ```
 
 源码基线：
