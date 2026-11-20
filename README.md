@@ -165,7 +165,7 @@ C-RID 的网页配置入口（`https://192.168.4.1`）和 BLE 数据通道完全
 
 ```bash
 python -m esptool --chip esp32c5 -p COM5 -b 460800 \
-    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.01-full-16mb.bin
+    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.0.1-full-16mb.bin
 ```
 
 同一页的 `...-parts.zip` 里是分体 bin 和一张 `FLASH.txt` 地址表，只想更新 C-RID 或想保留 NVS 设置时用；`SHA256SUMS.txt` 是校验和。
