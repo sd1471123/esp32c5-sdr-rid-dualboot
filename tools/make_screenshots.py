@@ -171,31 +171,64 @@ def boot_menu() -> Screen:
 
 # --------------------------------------------------------------------------- #
 # SDR: status bar + spectrum + waterfall + channel strip
+#
+# Band plan copied from sdr/main/local_ui/ui.c: band_lo()/band_hi(), the 20 MHz
+# channel tables and the 5 GHz purpose gaps. 2.4 GHz channels are 5 MHz apart
+# but 20 MHz wide, so the firmware gives them equal cells; 5 GHz channels never
+# overlap and sit on their real frequency, which leaves RADAR / SAT / ISM as
+# visible holes in the strip.
 # --------------------------------------------------------------------------- #
-def sdr_spectrum() -> Screen:
+BAND_24_CH = [(1, 2412), (2, 2417), (3, 2422), (4, 2427), (5, 2432), (6, 2437),
+              (7, 2442), (8, 2447), (9, 2452), (10, 2457), (11, 2462), (12, 2467),
+              (13, 2472)]
+BAND_5G_CH = [
+    (36, 5180), (40, 5200), (44, 5220), (48, 5240),
+    (52, 5260), (56, 5280), (60, 5300), (64, 5320),
+    (96, 5480), (100, 5500), (104, 5520), (108, 5540), (112, 5560), (116, 5580),
+    (120, 5600), (124, 5620), (128, 5640), (132, 5660), (136, 5680),
+    (140, 5700), (144, 5720),
+    (149, 5745), (153, 5765), (157, 5785), (161, 5805), (165, 5825),
+    (169, 5845), (173, 5865), (177, 5885),
+]
+BAND_5G_GAPS = [(5330, 5350, "RADAR", 8, 4), (5350, 5470, "SAT", 36, 18),
+                (5730, 5735, "ISM", 5, 2)]
+
+# Per-channel activity / detection percentages. Decoration only: the firmware
+# fills these from the sweep, here they just make the strip look plausible.
+ACT_24 = (34, 8, 61, 12, 5, 92, 44, 17, 9, 26, 7, 3, 12)
+DET_24 = (12, 4, 20, 6, 3, 38, 26, 9, 5, 14, 4, 2, 8)
+ACT_5G = (12, 3, 8, 26, 4, 2, 6, 11, 3, 45, 8, 4, 63, 12, 5, 9, 7, 3, 6, 4, 2,
+          88, 71, 54, 40, 31, 18, 12, 6)
+DET_5G = (6, 2, 4, 14, 3, 1, 3, 7, 2, 22, 4, 2, 33, 7, 3, 5, 4, 2, 3, 2, 1,
+          46, 38, 29, 21, 16, 9, 6, 3)
+
+
+def sdr_spectrum(band5g: bool = False) -> Screen:
+    lo, hi = (5170, 5895) if band5g else (2402, 2482)
+    channels = BAND_5G_CH if band5g else BAND_24_CH
+    gaps = BAND_5G_GAPS if band5g else []
+    act = ACT_5G if band5g else ACT_24
+    det = DET_5G if band5g else DET_24
+    tuned = 21 if band5g else 5          # ch149 / ch6
+    tuned_num, tuned_mhz = channels[tuned]
+
     s = Screen()
     s.fill(COL_BG)
 
+    def col(mhz: float) -> int:
+        return max(0, min(W, int((mhz - lo) * (W - 1) / (hi - lo))))
+
     # --- status bar (30 px), laid out like render_topbar() ---------------
     s.rect(0, 0, W, 30, COL_PANEL)
-    band = "2.4G"
-    band_w = s.text(4, 9, band, COL_TEXT, COL_PANEL, True)
+    band_w = s.text(4, 9, "5G" if band5g else "2.4G", COL_TEXT, COL_PANEL, True)
     bx, bw, bh, by = 4 + band_w + 5, 46, 20, 5
-    s.rect(bx, by, bw, bh, COL_TINT_C if False else COL_PANEL)
-    for x0, y0, x1, y1 in (
-        (bx, by, bx + bw - 1, by),
-        (bx, by + bh - 1, bx + bw - 1, by + bh - 1),
-        (bx, by, bx, by + bh - 1),
-        (bx + bw - 1, by, bx + bw - 1, by + bh - 1),
-    ):
-        s.draw.line([x0, y0, x1, y1], fill=COL_GREEN)
+    s.draw.rectangle([bx, by, bx + bw - 1, by + bh - 1], outline=COL_GREEN)
     live = "LIVE"
-    lw = len(live) * 8 - 1
-    s.text(bx + (bw - lw) // 2, by + 4, live, COL_GREEN, COL_PANEL, True)
-    s.text(bx + bw + 6, 9, "PK12 A5 D62%", COL_TEXT, COL_PANEL, True)
-    ch = "ch6 2437M"
-    cw_ = len(ch) * 8 - 1
-    s.text(W - 4 - cw_, 9, ch, COL_TEXT, COL_PANEL, True)
+    s.text(bx + (bw - (len(live) * 8 - 1)) // 2, by + 4, live, COL_GREEN, COL_PANEL, True)
+    s.text(bx + bw + 6, 9, "PK18 A7 D71%" if band5g else "PK12 A5 D62%",
+           COL_TEXT, COL_PANEL, True)
+    ch = f"ch{tuned_num} {tuned_mhz}M"
+    s.text(W - 4 - (len(ch) * 8 - 1), 9, ch, COL_TEXT, COL_PANEL, True)
 
     # --- spectrum (y 30..124) --------------------------------------------
     spec_y, spec_h = 30, 94
@@ -205,35 +238,36 @@ def sdr_spectrum() -> Screen:
     for gy in range(spec_y + 12, base, 24):
         s.draw.line([0, gy, W - 1, gy], fill=COL_GRID)
 
-    # Three fat 20 MHz Wi-Fi humps on a 2.4 GHz sweep, normalised to 0..1 so the
-    # trace fills roughly 80 % of the plot instead of pinning to the top edge.
-    power = lambda x, cx, amp, sig, fall: amp / (1.0 + ((x - cx) / sig) ** 2) ** fall
-    peaks = [(58, 0.86, 26, 1.6), (152, 0.94, 30, 1.6), (246, 0.72, 24, 1.6)]
+    # One 20 MHz block measured in pixels: 80 px on 2.4 GHz, 9 px on 5 GHz. The
+    # hump width follows it, which is why the 5 GHz trace is a picket fence and
+    # the 2.4 GHz one is three soft hills.
+    sig_px = max(2.0, 20 * (W - 1) / (hi - lo) * 0.55)
+    peaks = ([(5745, 0.90), (5180, 0.62), (5825, 0.55), (5500, 0.30)] if band5g
+             else [(2437, 0.88), (2462, 0.70), (2412, 0.42)])
 
     def level_at(x: float, jitter: float = 0.0) -> float:
-        v = 0.05 + jitter
-        for cx, amp, sig, fall in peaks:
-            v += power(x, cx, amp, sig, fall)
+        v = 0.04 + jitter
+        for mhz, amp in peaks:
+            v += amp / (1.0 + ((x - (mhz - lo) * (W - 1) / (hi - lo)) / sig_px) ** 2) ** 1.4
         return max(0.0, min(1.0, v))
 
     rnd = random.Random(20261120)
     points = []
     prev = 0.10
     for x in range(W):
-        env = level_at(x, rnd.uniform(-0.02, 0.02))
-        prev = prev * 0.35 + env * 0.65
+        prev = prev * 0.35 + level_at(x, rnd.uniform(-0.02, 0.02)) * 0.65
         points.append((x, base - int(prev * (spec_h - 12))))
     s.draw.line(points, fill=COL_TRACE, width=1)
-    # peak-hold: a dimmer line riding a few pixels above the live trace
     s.draw.line([(x, y - 4) for x, y in points], fill=c565(0x030F), width=1)
-    # callout chip, as render_spectrum() draws for the loudest peak
+
+    # callout chip for the channel the cursor is on, as render_spectrum() does
     s.rect(6, spec_y + 4, 88, 15, COL_PANEL)
     s.draw.rectangle([6, spec_y + 4, 6 + 87, spec_y + 4 + 14], outline=COL_AMBER)
-    s.text(9, spec_y + 8, "2442 -41dBm", COL_AMBER, COL_PANEL, False, 1)
+    # the callout follows the tuned channel, same as the firmware's peak chip
+    s.text(9, spec_y + 8, f"{tuned_mhz} {'-47' if band5g else '-41'}dBm",
+           COL_AMBER, COL_PANEL, False, 1)
 
     # --- waterfall (y 124..208) ------------------------------------------
-    # Each row is one capture: same channel humps, drifting a pixel or two, with
-    # per-pixel noise, then faded into black with age like the real waterfall.
     wf_y, wf_h = 124, 84
     px = Image.new("RGB", (W, wf_h))
     buf = px.load()
@@ -262,7 +296,7 @@ def sdr_spectrum() -> Screen:
     history: list[list[float]] = []
     for y in range(wf_h):
         drift += rnd.uniform(-0.5, 0.5)
-        drift = max(-3.0, min(3.0, drift))
+        drift = max(-2.5, min(2.5, drift))
         row = []
         for x in range(W):
             v = level_at(x + drift, rnd.uniform(-0.03, 0.03))
@@ -276,39 +310,63 @@ def sdr_spectrum() -> Screen:
     s.img.paste(px, (0, wf_y))
 
     # --- channel strip (y 208..240) ---------------------------------------
-    # 14 channel slots, bare channel numbers as labels (with the firmware's
-    # "skip when the next label would touch" rule), an ACT and a DET bar per
-    # slot and an accent underline under the tuned one.
     strip_y, strip_h = 208, 32
     s.rect(0, strip_y, W, strip_h, COL_STRIP)
     s.hline(0, strip_y, W, COL_BG)
-    slots, active = 14, 5
-    slot_w = W / slots
     act_y, det_y, bar_h = strip_y + 11, strip_y + 20, 7
-    last_right, first = 0, True
-    for i in range(slots):
-        x0 = int(i * slot_w)
-        x1 = int((i + 1) * slot_w) - 1
-        if i == active:
-            s.rect(x0, strip_y + 1, x1 - x0 + 1, strip_h - 1, COL_TINT_C)
-        # ACT bar: green below 12 dB over noise, amber above, red at the top
-        act = (34, 8, 61, 12, 5, 92, 44, 17, 9, 26, 7, 3, 12, 5)[i]
-        s.rect(x0, act_y, x1 - x0 + 1, bar_h, COL_GRID)
-        if act > 2:
-            s.rect(x0, act_y, max(1, (x1 - x0 + 1) * act // 100), bar_h,
-                   COL_GREEN if act < 50 else (COL_AMBER if act < 80 else COL_RED))
-        det = (12, 4, 20, 6, 3, 38, 26, 9, 5, 14, 4, 2, 8, 3)[i]
-        s.rect(x0, det_y, x1 - x0 + 1, bar_h, COL_GRID)
-        if det > 2:
-            s.rect(x0, det_y, max(1, (x1 - x0 + 1) * det // 100), bar_h, COL_USB)
-        tag = str(i + 1)
+    count = len(channels)
+
+    def slot_of(i: int) -> tuple[int, int]:
+        if not band5g:  # equal cells, exactly like strip_slot()
+            return i * W // count, (i + 1) * W // count
+        f = channels[i][1]
+        return col(f - 10), col(f + 10)
+
+    def bars(x0: int, x1: int, a: int, d: int, bg) -> None:
+        slot = x1 - x0 if x1 >= W else max(1, x1 - x0 - 1)
+        s.rect(x0, act_y, slot, bar_h, bg)
+        if a > 2:
+            s.rect(x0, act_y, max(1, slot * a // 100), bar_h,
+                   COL_GREEN if a < 50 else (COL_AMBER if a < 80 else COL_RED))
+        s.rect(x0, det_y, slot, bar_h, bg)
+        if d > 2:
+            s.rect(x0, det_y, max(1, slot * d // 100), bar_h, COL_USB)
+
+    # Purpose stretches first: on 5 GHz they occupy real holes in the strip.
+    for glo, ghi, tag, ga, gd in gaps:
+        x0, x1 = col(glo), col(ghi)
+        bars(x0, x1, ga, gd, COL_GRID)
         tw = len(tag) * 6 - 1
-        lx = max(1, x0 + (x1 - x0 + 1 - tw) // 2)
-        if not first and i + 1 != slots and lx < last_right + 4:
+        if tw + 3 > x1 - x0:  # no room for the word -> initial, else nothing
+            tag = tag[0]
+            tw = 5
+            if tw + 2 > x1 - x0:
+                continue
+        s.text(max(1, x0 + (x1 - x0 - tw) // 2), strip_y + 2, tag, COL_AMBER, COL_STRIP)
+
+    last_right, first = 0, True
+    for i, (num, _mhz) in enumerate(channels):
+        x0, x1 = slot_of(i)
+        sel = i == tuned
+        bg = COL_TINT_C if sel else COL_GRID
+        if sel:
+            s.rect(x0, strip_y + 1, x1 - x0, strip_h - 1, COL_TINT_C)
+        bars(x0, x1, act[i], det[i], bg)
+        tag = str(num)
+        tw = len(tag) * 6 - 1
+        lx = max(1, x0 + (x1 - x0 - tw) // 2)
+        if lx + tw > W - 1:  # keep the last label inside the panel
+            lx = W - 1 - tw
+        # The firmware drops a label when the next one would touch it; that is
+        # why 5 GHz only shows a handful of the 29 channel numbers.
+        if not first and i + 1 != count and lx < last_right + 4:
             continue
-        s.text(lx, strip_y + 2, tag, COL_DIM, COL_TINT_C if i == active else COL_STRIP)
+        s.text(lx, strip_y + 2, tag, COL_DIM, COL_TINT_C if sel else COL_STRIP)
         last_right, first = lx + tw, False
-    s.rect(int(active * slot_w), strip_y + strip_h - 3, int(slot_w) - 1, 2, COL_ACCENT)
+
+    tx0, _ = slot_of(tuned)
+    s.rect(tx0, strip_y + strip_h - 3, max(1, W // count - 1) if not band5g else 6, 2,
+           COL_ACCENT)
     return s
 
 
@@ -493,13 +551,14 @@ def rid_edit() -> Screen:
 # --------------------------------------------------------------------------- #
 PAGES = [
     ("01-boot-menu", "BOOT MENU", boot_menu),
-    ("02-sdr-spectrum", "SDR SPECTRUM", sdr_spectrum),
-    ("03-rid-status", "C-RID STATUS", rid_status),
-    ("04-rid-targets", "RX TARGETS", rid_targets),
-    ("05-rid-detail", "TARGET DETAIL", rid_detail),
-    ("06-rid-config", "CONFIG LIST", rid_config),
-    ("07-rid-edit", "EDIT CONFIG", rid_edit),
-    ("08-rid-about", "ABOUT", rid_about),
+    ("02-sdr-2g4", "SDR 2.4 GHz", lambda: sdr_spectrum(False)),
+    ("03-sdr-5g8", "SDR 5.8 GHz", lambda: sdr_spectrum(True)),
+    ("04-rid-status", "C-RID STATUS", rid_status),
+    ("05-rid-targets", "RX TARGETS", rid_targets),
+    ("06-rid-detail", "TARGET DETAIL", rid_detail),
+    ("07-rid-config", "CONFIG LIST", rid_config),
+    ("08-rid-edit", "EDIT CONFIG", rid_edit),
+    ("09-rid-about", "ABOUT", rid_about),
 ]
 
 

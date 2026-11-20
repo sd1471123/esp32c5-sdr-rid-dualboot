@@ -9,19 +9,24 @@
 
 ## 界面预览
 
-![八个页面总览](docs/screens/overview.png)
+![九个页面总览](docs/screens/overview.png)
 
 上面是**模拟渲染**图，不是相机拍屏：像素由固件自己的字库（`font5x7` / `font7x12`）和页面里写死的坐标逐个画出来，所以字号、行距、每行能塞多少字、灰阶配色都与实物一致，只是没有 IPS 视角、背光溢出这类光学效果。这样也方便改了 UI 之后重新出图对照。
+
+九宫格按使用顺序排列：开机菜单 → SDR 两个频段 → C-RID 状态 / 目标 / 详情 / 配置 / 关于。
 
 | 页面 | 截图 |
 |---|---|
 | 开机菜单（`←`/`B` 进 SDR，`→`/`M` 进 C-RID） | [`01-boot-menu.png`](docs/screens/01-boot-menu.png) |
-| SDR 频谱：状态栏 + 频谱 + 瀑布 + 信道条 | [`02-sdr-spectrum.png`](docs/screens/02-sdr-spectrum.png) |
-| C-RID 状态页（参数总览） | [`03-rid-status.png`](docs/screens/03-rid-status.png) |
-| C-RID 接收目标列表 | [`04-rid-targets.png`](docs/screens/04-rid-targets.png) |
-| 目标详情（12 行字段，只刷数值） | [`05-rid-detail.png`](docs/screens/05-rid-detail.png) |
-| 配置列表 / 编辑项 | [`06-rid-config.png`](docs/screens/06-rid-config.png) · [`07-rid-edit.png`](docs/screens/07-rid-edit.png) |
-| 关于页（版本 / 分区 / 背光档位） | [`08-rid-about.png`](docs/screens/08-rid-about.png) |
+| SDR 2.4 GHz：三个宽峰 + 13 格等分信道条 | [`02-sdr-2g4.png`](docs/screens/02-sdr-2g4.png) |
+| SDR 5.8 GHz：窄峰群 + 29 格频率轴，带 RADAR / SAT / ISM 区段 | [`03-sdr-5g8.png`](docs/screens/03-sdr-5g8.png) |
+| C-RID 状态页（参数总览） | [`04-rid-status.png`](docs/screens/04-rid-status.png) |
+| C-RID 接收目标列表 | [`05-rid-targets.png`](docs/screens/05-rid-targets.png) |
+| 目标详情（12 行字段，只刷数值） | [`06-rid-detail.png`](docs/screens/06-rid-detail.png) |
+| 配置列表 / 编辑项 | [`07-rid-config.png`](docs/screens/07-rid-config.png) · [`08-rid-edit.png`](docs/screens/08-rid-edit.png) |
+| 关于页（版本 / 分区 / 背光档位） | [`09-rid-about.png`](docs/screens/09-rid-about.png) |
+
+2.4G 和 5.8G 两张图能看出信道条的两种画法：2.4 GHz 信道间隔只有 5 MHz 但每个占 20 MHz，按频率画会互相压成一团，所以固件改成 13 个等分格；5.8 GHz 信道本来就不重叠，就直接摆到频率轴上，RADAR / SAT / ISM 三段空隙自然露出来。
 
 重新出图（每张同时输出 1× 和 2× 两版）：
 
