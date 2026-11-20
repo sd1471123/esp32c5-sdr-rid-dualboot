@@ -1,0 +1,552 @@
+/* Minimal polling SPI driver for the 3.2" 240x320 panel on the local UI. The
+ * controller is an ILI9341 (GMT032-8P-SPI module); an ST7789 variant is kept
+ * behind LCD_CTRL_ILI9341 for other panels. A small staging buffer is used to
+ * byte-swap RGB565 pixels; it lives on the heap so the C5 SRAM window reserved
+ * for the RF dump stays clear of static data. */
+#include "st7789.h"
+#include "board_c5_lcd.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_heap_caps.h"
+#include "esp_rom_gpio.h"
+#include "esp_rom_sys.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/ledc_struct.h"
+#include "soc/pcr_struct.h"
+#include <string.h>
+
+#define LCD_SPI_HOST SPI2_HOST
+#define STAGE_PIXELS 512
+
+/* Backlight dimmer.
+ *
+ * GP23 drives the module's BL pin, which on this glass is the LED string's
+ * cathode through a series resistor — a plain high/low there can only be "full"
+ * or "off", and full brightness is what made the near-black UI look washed out.
+ *
+ * The obvious route, esp_driver_ledc, was tried and rejected: it pushes BSS past
+ * 0x40820000, the SRAM bank the C5 modem owns during adctrig, and the
+ * sram_guard.ld assertion stops the link. The registers below do the same job in
+ * a few writes and add no static data at all.
+ *
+ * 13-bit at 5 kHz: 80 MHz / (500/256) / 8192 = 5000.0 Hz exactly, so both the
+ * divider and the frequency are exact.
+ *
+ * Do not raise this casually. Mid duties (25-75 %) make the 90 mA LED pulses
+ * modulate the 3V3 rail, and the panel's VCOM rides on that rail, so a slow
+ * "water ripple" of horizontal bands drifts across the glass. 40 kHz / 10-bit
+ * was tried and did not clear it: the panel scans a line every ~69 us, so even
+ * at 40 kHz a row only averages 2.8 PWM periods. Going further needs a MOSFET
+ * in place of the S8050 (its 1-2 us storage time destroys narrow pulses) plus
+ * bulk capacitance on the rail, which is hardware work, not a register change.
+ * For now the UI only exposes 10 % and 100 %, the two duties that measured
+ * clean. */
+#define BL_CHANNEL   0
+#define BL_TIMER     0
+/* XTAL is 40 MHz and stable from boot; PLL_F80M is derived from SPLL, which is
+ * only enabled by the Wi-Fi/RF init. The launcher and RID configure the
+ * backlight BEFORE Wi-Fi comes up, so selecting PLL_F80M there leaves the timer
+ * with no clock (counter stuck at 0) and dimming silently falls back to a
+ * GPIO that is always on. 40 MHz / 1.953125 / 4096 = 5 kHz, same PWM frequency
+ * as the old 80 MHz / 1.953125 / 8192 setup, hence 12 duty bits instead of 13. */
+#define BL_DUTY_BITS 12
+#define BL_DIV_Q8    500 /* 1.953125 * 256 */
+#define BL_DUTY_FULL (1u << BL_DUTY_BITS)
+
+static bool bl_pwm_ready;
+
+static void backlight_pwm_init(void) {
+    /* Clock tree first, and in this order. Two separate gates exist on C5:
+     * ledc_clk_en is the APB bus clock for the register file, ledc_sclk_en is
+     * the functional clock the timer counts on. The driver enables both; writing
+     * the registers by hand it is easy to set only the bus clock, and then the
+     * timer never advances. The channel output stays parked at its idle level,
+     * the backlight never lights, and it looks like "stuck at 0 %" no matter
+     * which preset is selected. */
+    PCR.ledc_conf.ledc_clk_en = 1;
+    /* ledc_sclk_sel is a TWO-bit field on C5: 0 = XTAL (40 MHz), 1 = RC_FAST,
+     * 2 = PLL_F80M. PLL_F80M comes from SPLL, which Wi-Fi/RF init turns on
+     * later; at this point (launcher / RID boot) it has no clock, so the timer
+     * counter never advances. XTAL is the main crystal, already running at
+     * boot, so the timer is guaranteed to count. Keep 0 here. */
+    PCR.ledc_sclk_conf.ledc_sclk_sel = 0; /* XTAL, 40 MHz - always available */
+    PCR.ledc_sclk_conf.ledc_sclk_en = 1;
+    PCR.ledc_conf.ledc_rst_en = 1;
+    PCR.ledc_conf.ledc_rst_en = 0;
+    PCR.ledc_pd_ctrl.ledc_mem_force_pu = 1;
+    PCR.ledc_pd_ctrl.ledc_mem_force_pd = 0;
+
+    volatile ledc_timer_group_reg_t *tg = &LEDC.timer_group[BL_TIMER];
+    tg->timer[BL_TIMER].conf.clk_div = BL_DIV_Q8;
+    tg->timer[BL_TIMER].conf.duty_res = BL_DUTY_BITS;
+    tg->timer[BL_TIMER].conf.pause = 1; /* hold while the channel is set up */
+    tg->timer[BL_TIMER].conf.para_up = 1;
+    tg->timer[BL_TIMER].conf.rst = 1;
+    tg->timer[BL_TIMER].conf.rst = 0;
+
+    volatile ledc_chn_reg_t *ch = &LEDC.channel_group[BL_CHANNEL].channel[BL_CHANNEL];
+    ch->conf0.timer_sel = BL_TIMER;
+    ch->conf0.idle_lv = 0; /* off while the channel is idle = 0 % */
+    ch->conf0.sig_out_en = 1;
+    ch->duty_init.duty = 0;
+    ch->conf1.duty_start = 1;
+    ch->conf0.para_up = 1; /* latch the channel config */
+
+    tg->timer[BL_TIMER].conf.pause = 0;
+    tg->timer[BL_TIMER].conf.para_up = 1;
+    /* Route the channel to the pin through the GPIO matrix; nothing appears on
+     * GP23 without this even though sig_out_en is set. */
+    esp_rom_gpio_connect_out_signal(LCD_PIN_BL, LEDC_LS_SIG_OUT0_IDX + BL_CHANNEL, false, false);
+
+    /* Prove the timer is actually running before trusting it. The sample gap has
+     * to be a NON-multiple of the PWM period: the first build sampled 400 us
+     * apart at 5 kHz, which is exactly two periods, so the counter came back to
+     * the same value every time and a perfectly healthy timer looked dead. 137 us
+     * is 0.685 of a period here, and it is not a whole number of periods at any
+     * of the frequencies this file has been tried at. Two equal samples therefore
+     * really do mean the block has no clock. Rather than ship a black screen, hand
+     * the pin back to a plain GPIO and run at full brightness — the pre-PWM
+     * behaviour — so the UI is always readable. */
+    uint32_t cnt_a = tg->timer[BL_TIMER].value.timern_cnt;
+    esp_rom_delay_us(137);
+    uint32_t cnt_b = tg->timer[BL_TIMER].value.timern_cnt;
+    bl_pwm_ready = (cnt_a != cnt_b);
+    if (!bl_pwm_ready) {
+        /* Only speak up on failure - a healthy timer must stay silent on UART. */
+        printf("LCD backlight: LEDC timer not counting (cntA=%u cntB=%u), "
+               "falling back to always-on GPIO\n", (unsigned)cnt_a, (unsigned)cnt_b);
+        esp_rom_gpio_connect_out_signal(LCD_PIN_BL, SIG_GPIO_OUT_IDX, false, false);
+        gpio_set_level(LCD_PIN_BL, 1);
+    }
+}
+
+void lcd_backlight_set(uint8_t pct) {
+    if (pct > 100) pct = 100;
+    if (!bl_pwm_ready) {
+        /* PWM never came up (see the counter probe in the init above), so the
+         * pin is back to plain GPIO. Dimming is impossible in that mode; keep the
+         * panel lit rather than let a 0 % preset leave the user with a black
+         * screen and no way to tell whether the board is alive. */
+        gpio_set_level(LCD_PIN_BL, 1);
+        return;
+    }
+    volatile ledc_chn_reg_t *ch = &LEDC.channel_group[BL_CHANNEL].channel[BL_CHANNEL];
+    /* duty_init carries four fractional bits, so the integer part shifts left. */
+    ch->duty_init.duty = (uint32_t)pct * BL_DUTY_FULL / 100u << 4;
+    ch->conf1.duty_start = 1;
+    ch->conf0.para_up = 1;
+}
+
+/* Controller on the 8-pin GMT032-8P-SPI module is an ST7789 (240x320). An
+ * ILI9341 power-on sequence is kept behind LCD_CTRL_ILI9341 because the two
+ * parts look identical from the header and the wrong sequence shows up as
+ * nothing but GRAM noise. */
+#ifndef LCD_CTRL_ILI9341
+#define LCD_CTRL_ILI9341 0
+#endif
+
+/* MADCTL per orientation. The panel is 240x320; landscape swaps the axes. */
+#if LCD_CTRL_ILI9341
+#define LCD_MADCTL_LAND 0x28 /* MV | BGR */
+#define LCD_MADCTL_PORT 0x48 /* MX | BGR */
+#else
+#define LCD_MADCTL_LAND 0x60 /* MX | MV */
+#define LCD_MADCTL_PORT 0x00
+#endif
+
+/* Bring-up escape hatches. The module header has two adjacent pairs that are
+ * trivially swapped when hand-wiring: SCL/SDI and RES/AO. Flipping these two
+ * macros rebuilds the driver against the other pin order, which is faster than
+ * re-seating four dupont leads when the panel stays blank. */
+#ifndef LCD_SWAP_SCL_SDI
+#define LCD_SWAP_SCL_SDI 0
+#endif
+#ifndef LCD_SWAP_DC_RST
+#define LCD_SWAP_DC_RST 0
+#endif
+
+#if LCD_SWAP_SCL_SDI
+#define PIN_SCK  LCD_PIN_MOSI
+#define PIN_MOSI LCD_PIN_SCK
+#else
+#define PIN_SCK  LCD_PIN_SCK
+#define PIN_MOSI LCD_PIN_MOSI
+#endif
+#if LCD_SWAP_DC_RST
+#define PIN_DC  LCD_PIN_RST
+#define PIN_RST LCD_PIN_DC
+#else
+#define PIN_DC  LCD_PIN_DC
+#define PIN_RST LCD_PIN_RST
+#endif
+
+/* Bring-up knobs. 8 MHz without DMA dropped bytes on this wiring (blank white,
+ * a lone vertical line, or GRAM snow); with DMA and the 2 us CS setup time it is
+ * stable and halves the time a full frame spends on the bus — the single biggest
+ * lever against tearing, since the panel has no VSYNC. If the picture turns to
+ * snow, override with -DLCD_SPI_HZ=4000000 (or flash the 4 MHz fallback image).
+ * Keep the DMA channel and the manual CS handling together. */
+#ifndef LCD_SPI_HZ
+#define LCD_SPI_HZ 8000000
+#endif
+
+/* Visible-area offset inside the controller GRAM. A 240x320 panel needs 0/0,
+ * 240x240 squares sit at y=80. If the image is shifted by a constant amount or
+ * wrapped, change these two instead of touching the drawing code. */
+#ifndef LCD_OFS_X
+#define LCD_OFS_X 0
+#endif
+#ifndef LCD_OFS_Y
+#define LCD_OFS_Y 0
+#endif
+
+/* Paint solid bars and a 1 px frame right after init so a wiring fault can be
+ * told apart from a drawing fault. Set to 0 for a silent boot. */
+#ifndef LCD_SELFTEST
+#define LCD_SELFTEST 0
+#endif
+
+/* Every pixel is inverted in software before it goes out.
+ *
+ * The INVON/INVOFF command is not a reliable switch on this glass: the module
+ * renders the opposite polarity whichever of 0x20/0x21 it was sent, so the
+ * near-black UI came out as a white page and a "dark" background was impossible
+ * to reach by command alone. Inverting the data ourselves is deterministic —
+ * whatever the panel does, the two inversions cancel. Measured on the panel
+ * running 0x21: background was pure white, so the data is inverted here. */
+#ifndef LCD_INVERT_DATA
+#define LCD_INVERT_DATA 1
+#endif
+#if LCD_INVERT_DATA
+#define LCD_PIX(v) ((uint16_t)((v) ^ 0xffffu))
+#else
+#define LCD_PIX(v) ((uint16_t)(v))
+#endif
+
+static spi_device_handle_t lcd_spi;
+static uint16_t *stage;
+static unsigned lcd_w = 320, lcd_h = 240;
+static bool landscape = true;
+static bool cs_low;
+
+static void lcd_selftest(void);
+
+/* CS is driven by hand rather than by the SPI peripheral.
+ *
+ * With the peripheral owning CS, every spi_device_polling_transmit() raises the
+ * line on the way out, so a command and its parameters — and worse, RAMWR and
+ * the pixel stream that follows it — end up in separate CS windows. A panel
+ * that latches on the CS edge simply keeps an empty GRAM in that case, which on
+ * this IPS part means the screen stays uniformly white no matter what is drawn.
+ * Holding CS low across the whole logical transaction costs nothing and removes
+ * the failure mode. */
+static void cs_assert(void) {
+    if (cs_low) return;
+    gpio_set_level(LCD_PIN_CS, 0);
+    esp_rom_delay_us(2);
+    cs_low = true;
+}
+
+static void cs_release(void) {
+    if (!cs_low) return;
+    esp_rom_delay_us(2);
+    gpio_set_level(LCD_PIN_CS, 1);
+    cs_low = false;
+}
+
+static void lcd_cmd(uint8_t cmd, const uint8_t *data, size_t len) {
+    cs_assert();
+    gpio_set_level(PIN_DC, 0);
+    spi_transaction_t t = {.length = 8, .tx_buffer = &cmd};
+    spi_device_polling_transmit(lcd_spi, &t);
+    if (len) {
+        gpio_set_level(PIN_DC, 1);
+        spi_transaction_t d = {.length = len * 8, .tx_buffer = data};
+        spi_device_polling_transmit(lcd_spi, &d);
+    }
+    cs_release();
+}
+
+static void lcd_cmd1(uint8_t cmd, uint8_t value) { lcd_cmd(cmd, &value, 1); }
+
+static void lcd_reset(void) {
+    gpio_set_level(PIN_RST, 0);
+    esp_rom_delay_us(20000);
+    gpio_set_level(PIN_RST, 1);
+    esp_rom_delay_us(120000);
+}
+
+bool lcd_init(void) {
+    if (stage) return true;
+    stage = heap_caps_malloc(STAGE_PIXELS * sizeof(uint16_t), MALLOC_CAP_8BIT);
+    if (!stage) return false;
+
+    const gpio_config_t out = {
+        .pin_bit_mask = UI_PIN_MASK(PIN_DC) | UI_PIN_MASK(PIN_RST) | UI_PIN_MASK(LCD_PIN_CS) |
+                        UI_PIN_MASK(LCD_PIN_BL),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&out);
+    gpio_set_level(LCD_PIN_BL, 0);
+    gpio_set_level(LCD_PIN_CS, 1);
+    gpio_set_level(PIN_DC, 1);
+    gpio_set_level(PIN_RST, 1);
+
+    spi_bus_config_t bus = {
+        .mosi_io_num = PIN_MOSI,
+        .miso_io_num = -1,
+        .sclk_io_num = PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = STAGE_PIXELS * 2,
+    };
+    if (spi_bus_initialize(LCD_SPI_HOST, &bus, SPI_DMA_CH_AUTO) != ESP_OK) return false;
+
+    spi_device_interface_config_t dev = {
+        .clock_speed_hz = LCD_SPI_HZ,
+        .mode = 0,
+        .spics_io_num = -1, /* CS handled by hand; see cs_assert() */
+        .queue_size = 1,
+    };
+    if (spi_bus_add_device(LCD_SPI_HOST, &dev, &lcd_spi) != ESP_OK) return false;
+
+    /* Re-assert the control pins after the bus is up. GPIO4 and GPIO5 are the
+     * FSPI HD/WP pins by IO_MUX default on this part, so bringing up SPI2 is
+     * the one moment their function can be pulled out from under DC/RST. Doing
+     * this again costs nothing and rules that failure mode out. */
+    gpio_config(&out);
+    gpio_set_level(LCD_PIN_BL, 0);
+    gpio_set_level(PIN_DC, 1);
+    gpio_set_level(PIN_RST, 1);
+
+    lcd_reset();
+#if LCD_CTRL_ILI9341
+    lcd_cmd(0x01, NULL, 0); /* software reset */
+    esp_rom_delay_us(10000);
+    lcd_cmd(0x28, NULL, 0); /* display off while the power stages settle */
+
+    const uint8_t pcb[] = {0x00, 0xc1, 0x30};
+    lcd_cmd(0xcf, pcb, sizeof(pcb)); /* power control B */
+    const uint8_t posc[] = {0x64, 0x03, 0x12, 0x81};
+    lcd_cmd(0xed, posc, sizeof(posc)); /* power on sequence control */
+    const uint8_t dta[] = {0x85, 0x00, 0x78};
+    lcd_cmd(0xe8, dta, sizeof(dta)); /* driver timing control A */
+    const uint8_t pca[] = {0x39, 0x2c, 0x00, 0x34, 0x02};
+    lcd_cmd(0xcb, pca, sizeof(pca)); /* power control A */
+    lcd_cmd1(0xf7, 0x20);            /* pump ratio control */
+    const uint8_t dtb[] = {0x00, 0x00};
+    lcd_cmd(0xea, dtb, sizeof(dtb));  /* driver timing control B */
+    lcd_cmd1(0xc0, 0x23);             /* power control 1, GVDD 4.60 V */
+    lcd_cmd1(0xc1, 0x10);             /* power control 2, step-up factor */
+    const uint8_t vcom1[] = {0x3e, 0x28};
+    lcd_cmd(0xc5, vcom1, sizeof(vcom1)); /* VCOM control 1 */
+    lcd_cmd1(0xc7, 0x86);                /* VCOM control 2, offset -6 */
+    lcd_cmd1(0x36, landscape ? LCD_MADCTL_LAND : LCD_MADCTL_PORT);
+    lcd_cmd1(0x3a, 0x55); /* 16-bit RGB565 */
+
+    const uint8_t frate[] = {0x00, 0x18};
+    lcd_cmd(0xb1, frate, sizeof(frate)); /* frame rate 79 Hz */
+    const uint8_t dfc[] = {0x08, 0x82, 0x27};
+    lcd_cmd(0xb6, dfc, sizeof(dfc)); /* display function control */
+    lcd_cmd1(0xf2, 0x00);            /* 3 gamma off */
+    lcd_cmd1(0x26, 0x01);            /* gamma curve 1 */
+    const uint8_t gamma_pos[] = {0x0f, 0x31, 0x2b, 0x0c, 0x0e, 0x08, 0x4e, 0xf1,
+                                 0x37, 0x07, 0x10, 0x03, 0x0e, 0x09, 0x00};
+    lcd_cmd(0xe0, gamma_pos, sizeof(gamma_pos));
+    const uint8_t gamma_neg[] = {0x00, 0x0e, 0x14, 0x03, 0x11, 0x07, 0x31, 0xc1,
+                                 0x48, 0x08, 0x0f, 0x0c, 0x31, 0x36, 0x0f};
+    lcd_cmd(0xe1, gamma_neg, sizeof(gamma_neg));
+
+    lcd_cmd(0x11, NULL, 0); /* sleep out */
+    esp_rom_delay_us(120000);
+    lcd_cmd(0x29, NULL, 0); /* display on */
+    esp_rom_delay_us(20000);
+#else
+    /* Vendor sequence for the GMT320-8P module, taken from the C51 demo the
+     * seller ships (TFT_init() in main.c). Two things there matter:
+     *   - the last display-mode command is 0x20 (inversion OFF). With 0x21 the
+     *     dark UI came out as a white page with dark hairlines, which is what
+     *     "a pile of brackets and little dashes" actually was.
+     *   - the power/gamma table is tuned for this panel; the generic ST7789
+     *     values give washed-out contrast.
+     * MADCTL is the one value we keep under our control so the UI can rotate. */
+    lcd_cmd1(0x3a, 0x05); /* 16 bpp RGB565, as the demo sends it */
+    lcd_cmd1(0x36, landscape ? LCD_MADCTL_LAND : LCD_MADCTL_PORT);
+    lcd_cmd1(0xc5, 0x1a); /* VCOM */
+
+    const uint8_t porctrl[] = {0x05, 0x05, 0x00, 0x33, 0x33};
+    lcd_cmd(0xb2, porctrl, sizeof(porctrl)); /* porch setting */
+    lcd_cmd1(0xb7, 0x05);                    /* gate control, 12.2 V / -10.43 V */
+    lcd_cmd1(0xbb, 0x3f);                    /* VCOM */
+    lcd_cmd1(0xc0, 0x2c);                    /* power control */
+    lcd_cmd1(0xc2, 0x01);                    /* VDV/VRH enable */
+    lcd_cmd1(0xc3, 0x0f);                    /* VRH */
+    lcd_cmd1(0xc4, 0x20);                    /* VDV */
+    lcd_cmd1(0xc6, 0x01);                    /* frame rate 111 Hz */
+    const uint8_t pwctrl[] = {0xa4, 0xa1};
+    lcd_cmd(0xd0, pwctrl, sizeof(pwctrl));
+    lcd_cmd1(0xe8, 0x03);
+    const uint8_t eqtime[] = {0x09, 0x09, 0x08};
+    lcd_cmd(0xe9, eqtime, sizeof(eqtime));
+
+    const uint8_t gamma_pos[] = {0xd0, 0x05, 0x09, 0x09, 0x08, 0x14, 0x28,
+                                 0x33, 0x3f, 0x07, 0x13, 0x14, 0x28, 0x30};
+    lcd_cmd(0xe0, gamma_pos, sizeof(gamma_pos));
+    const uint8_t gamma_neg[] = {0xd0, 0x05, 0x09, 0x09, 0x08, 0x03, 0x24,
+                                 0x32, 0x32, 0x3b, 0x14, 0x13, 0x28, 0x2f};
+    lcd_cmd(0xe1, gamma_neg, sizeof(gamma_neg));
+
+    /* This IPS panel is normally white: leaving inversion off makes every dark
+     * colour read as its inverse, so the near-black UI came out pale grey with
+     * dark text. 0x21 cancels the panel's own inversion and gives back the
+     * intended colours. (The vendor C51 demo ends with 0x20 because its own
+     * palette is already inverted.) */
+    lcd_cmd(0x21, NULL, 0); /* inversion on */
+    lcd_cmd(0x11, NULL, 0); /* sleep out */
+    esp_rom_delay_us(120000);
+    lcd_cmd(0x29, NULL, 0); /* display on */
+    esp_rom_delay_us(20000);
+#endif
+    /* Hand the backlight pin over to the PWM channel. It stays at 0 until the UI
+     * has read the saved brightness, so the first thing on screen is never a
+     * full-white flash. */
+    backlight_pwm_init();
+    lcd_backlight_set(0);
+#if LCD_SELFTEST
+    lcd_selftest();
+#endif
+    return true;
+}
+
+void lcd_set_rotation(bool want_landscape) {
+    if (!lcd_spi || want_landscape == landscape) return;
+    landscape = want_landscape;
+    lcd_cmd1(0x36, landscape ? LCD_MADCTL_LAND : LCD_MADCTL_PORT);
+    if (landscape) {
+        lcd_w = 320;
+        lcd_h = 240;
+    } else {
+        lcd_w = 240;
+        lcd_h = 320;
+    }
+}
+
+unsigned lcd_width(void) { return lcd_w; }
+unsigned lcd_height(void) { return lcd_h; }
+
+uint16_t lcd_rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3));
+}
+
+void lcd_set_window(unsigned x, unsigned y, unsigned w, unsigned h) {
+    if (!w || !h) return;
+    x += LCD_OFS_X;
+    y += LCD_OFS_Y;
+    unsigned x1 = x + w - 1, y1 = y + h - 1;
+    uint8_t cols[] = {x >> 8, x, x1 >> 8, x1};
+    uint8_t rows[] = {y >> 8, y, y1 >> 8, y1};
+    lcd_cmd(0x2a, cols, 4);
+    lcd_cmd(0x2b, rows, 4);
+
+    /* RAMWR deliberately leaves CS asserted: the pixel stream that follows must
+     * live in the same window, and lcd_pixels()/lcd_fill_rect() release it. */
+    cs_assert();
+    gpio_set_level(PIN_DC, 0);
+    uint8_t ramwr = 0x2c;
+    spi_transaction_t t = {.length = 8, .tx_buffer = &ramwr};
+    spi_device_polling_transmit(lcd_spi, &t);
+    gpio_set_level(PIN_DC, 1);
+}
+
+/* Stream pixels without dropping CS. Several calls in a row become one long
+ * RAMWR, which is what the waterfall needs: re-opening a one-row window for
+ * every line costs a command burst and a CS edge per row, and lets the panel's
+ * own scan run between rows. */
+void lcd_pixels_cont(const uint16_t *pixels, unsigned count) {
+    while (count) {
+        unsigned chunk = count > STAGE_PIXELS ? STAGE_PIXELS : count;
+        for (unsigned j = 0; j < chunk; j++) {
+            uint16_t v = LCD_PIX(pixels[j]);
+            stage[j] = (uint16_t)((v >> 8) | (v << 8));
+        }
+        gpio_set_level(PIN_DC, 1);
+        spi_transaction_t t = {.length = chunk * 16, .tx_buffer = stage};
+        spi_device_polling_transmit(lcd_spi, &t);
+        pixels += chunk;
+        count -= chunk;
+    }
+}
+
+void lcd_pixels(const uint16_t *pixels, unsigned count) {
+    lcd_pixels_cont(pixels, count);
+    cs_release();
+}
+
+void lcd_pixels_end(void) { cs_release(); }
+
+void lcd_fill_rect(unsigned x, unsigned y, unsigned w, unsigned h, uint16_t color) {
+    if (!w || !h) return;
+    lcd_set_window(x, y, w, h);
+    uint16_t solid = LCD_PIX(color);
+    uint16_t swapped = (uint16_t)((solid >> 8) | (solid << 8));
+    for (unsigned j = 0; j < STAGE_PIXELS; j++) stage[j] = swapped;
+    unsigned total = w * h;
+    gpio_set_level(PIN_DC, 1);
+    while (total) {
+        unsigned chunk = total > STAGE_PIXELS ? STAGE_PIXELS : total;
+        spi_transaction_t t = {.length = chunk * 16, .tx_buffer = stage};
+        spi_device_polling_transmit(lcd_spi, &t);
+        total -= chunk;
+    }
+    cs_release();
+}
+
+void lcd_fill(uint16_t color) { lcd_fill_rect(0, 0, lcd_w, lcd_h, color); }
+
+void lcd_draw_bitmap2(unsigned x, unsigned y, unsigned w, unsigned h, const uint8_t *pixels,
+                      const uint16_t palette[4]) {
+    if (!w || !h || w > STAGE_PIXELS) return;
+    lcd_set_window(x, y, w, h);
+    gpio_set_level(PIN_DC, 1);
+    for (unsigned row = 0; row < h; row++) {
+        const uint8_t *src = pixels + row * ((w + 3) / 4);
+        for (unsigned col = 0; col < w; col++) {
+            unsigned shift = 6 - 2 * (col & 3);
+            unsigned idx = (src[col >> 2] >> shift) & 3;
+            uint16_t c = LCD_PIX(palette[idx]);
+            stage[col] = (uint16_t)((c >> 8) | (c << 8));
+        }
+        spi_transaction_t t = {.length = w * 16, .tx_buffer = stage};
+        spi_device_polling_transmit(lcd_spi, &t);
+    }
+    cs_release();
+}
+
+#if LCD_SELFTEST
+/* Solid bars first, then a 1 px frame with a checkerboard. If the frame hugs
+ * all four edges the bus, the window and MADCTL agree with the panel; a torn
+ * or wrapped frame points at the resolution offset, and speckle inside a solid
+ * bar points at the SPI clock or a floating data line. */
+static void lcd_selftest(void) {
+    static const uint16_t bars[] = {0xf800, 0x07e0, 0x001f, 0xffff, 0x0000};
+    for (unsigned i = 0; i < sizeof(bars) / sizeof(bars[0]); i++) {
+        lcd_fill(bars[i]);
+        esp_rom_delay_us(500000);
+    }
+    lcd_fill(0x0000);
+    lcd_fill_rect(0, 0, lcd_w, 1, 0xffff);
+    lcd_fill_rect(0, lcd_h - 1, lcd_w, 1, 0xffff);
+    lcd_fill_rect(0, 0, 1, lcd_h, 0xffff);
+    lcd_fill_rect(lcd_w - 1, 0, 1, lcd_h, 0xffff);
+    for (unsigned y = 0; y < lcd_h; y += 16) {
+        for (unsigned x = 0; x < lcd_w; x += 16) {
+            if (((x >> 4) + (y >> 4)) & 1) lcd_fill_rect(x, y, 16, 16, 0xffff);
+        }
+    }
+    esp_rom_delay_us(800000);
+    lcd_fill(0x0000);
+}
+#endif

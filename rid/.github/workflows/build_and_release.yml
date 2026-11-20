@@ -1,0 +1,224 @@
+name: ESP32 Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32s3, esp32c5]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # page_gz.h 不入库（.gitignore 排除），编译前必须先由源码生成
+    - name: Generate gzip page resources
+      run: python3 tools/gen_gzpage.py
+
+    - name: Build unified firmware (${{ matrix.target }})
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v6.1
+        target: ${{ matrix.target }}
+        path: '.'
+        # sdkconfig 不入库，显式 set-target 由 sdkconfig.defaults* 生成各芯片配置
+        command: idf.py set-target ${{ matrix.target }} && idf.py build
+
+    - name: Collect firmware (${{ matrix.target }})
+      run: |
+        # ESP-IDF CI 容器以 root 写出 build/，runner 用户无权限，先改属主
+        sudo chown -R $(id -u):$(id -g) build
+        # 收集到 runner 的临时目录，不要用仓库里的 dist/：
+        # dist/ 存放已发布的预编译镜像（remoteid_scanner_s3_vX.bin / _c5_vX.bin，
+        # 两芯片同时存在），在 dist/ 里 zip -r . 会连另一个芯片的固件一起打包，
+        # 导致每个包白带约 3MB。这里改成干净的空目录，只放本 target 的产物。
+        PKG="$RUNNER_TEMP/pkg"
+        rm -rf "$PKG"
+        D="$PKG/remoteid_scanner_${{ matrix.target }}"
+        mkdir -p "$D/bootloader" "$D/partition_table"
+        cp build/*.bin build/*.elf "$D/" 2>/dev/null || true
+        # 只取产物文件，不要 cp -r 整个目录：build/bootloader 里有 16MB 的
+        # CMakeCache / CMakeFiles / .ninja_log / 目标文件，属于构建中间件，
+        # 打进发布包既白白变胖，也会泄漏构建机的绝对路径。
+        cp build/bootloader/*.bin build/bootloader/*.elf "$D/bootloader/" 2>/dev/null || true
+        cp build/partition_table/*.bin "$D/partition_table/" 2>/dev/null || true
+        ls -lR "$PKG"
+        ( cd "$PKG" && zip -r "$GITHUB_WORKSPACE/esp32-ChinaRemoteID_Scan_Sim-${{ matrix.target }}.zip" . )
+
+    # 兜底断言：包里只能有本芯片的东西。以前 dist/ 被整体打包，
+    # S3 的 zip 里混进了 remoteid_scanner_c5_v2.0.2.bin，属于静默污染，必须挡住。
+    - name: Verify package contents (${{ matrix.target }})
+      run: |
+        Z="esp32-ChinaRemoteID_Scan_Sim-${{ matrix.target }}.zip"
+        # 先把清单落盘再校验：Actions 的 bash 带 -o pipefail，
+        # 直接 unzip | grep -q 会因 grep 提前退出产生 SIGPIPE(141)，让检查被静默跳过。
+        LIST="$RUNNER_TEMP/zip_names.txt"
+        unzip -Z1 "$Z" > "$LIST"
+        cat "$LIST"
+        TOP=$(cut -d/ -f1 "$LIST" | grep -v '^$' | sort -u)
+        if [ "$TOP" != "remoteid_scanner_${{ matrix.target }}" ]; then
+          echo "::error::包内顶层条目应为 remoteid_scanner_${{ matrix.target }}，实际为: $TOP"
+          exit 1
+        fi
+        if grep -qE '_(c5|s3)_v[0-9]' "$LIST"; then
+          echo "::error::包内混入了另一个芯片的预编译镜像"
+          exit 1
+        fi
+        if [ "${{ matrix.target }}" = "esp32s3" ] && grep -qi 'esp32c5' "$LIST"; then
+          echo "::error::S3 包内出现 esp32c5 产物"; exit 1
+        fi
+        if [ "${{ matrix.target }}" = "esp32c5" ] && grep -qi 'esp32s3' "$LIST"; then
+          echo "::error::C5 包内出现 esp32s3 产物"; exit 1
+        fi
+        # 构建中间件不得进包（CMakeCache 里有构建机绝对路径，且体积可观）
+        if grep -qE 'CMakeCache|CMakeFiles|\.ninja|\.o$|\.obj$' "$LIST"; then
+          echo "::error::包内混入了构建中间件"; exit 1
+        fi
+        echo "包内容校验通过：仅含 $TOP（$(wc -l < "$LIST") 个条目）"
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: esp32-ChinaRemoteID_Scan_Sim-${{ matrix.target }}
+        path: esp32-ChinaRemoteID_Scan_Sim-${{ matrix.target }}.zip
+
+  # 打包安卓 App：应用内「检查更新」直接从这个 Release 里取 apk
+  android:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v4
+
+    # tag 推 v2.0.2 时，APK 里的 versionName 也必须是 2.0.2，
+    # 否则应用内更新会一直以为还有新版
+    - name: Resolve app version
+      id: ver
+      run: |
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          V="${GITHUB_REF_NAME#v}"
+        else
+          V="0.0.0"
+        fi
+        MAJ=$(echo "$V" | cut -d. -f1)
+        MIN=$(echo "$V" | cut -d. -f2)
+        PAT=$(echo "$V" | cut -d. -f3 | tr -cd '0-9')
+        MAJ=${MAJ:-0}; MIN=${MIN:-0}; PAT=${PAT:-0}
+        CODE=$((10#$MAJ * 10000 + 10#$MIN * 100 + 10#$PAT))
+        echo "name=$V" >> "$GITHUB_OUTPUT"
+        echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+    - name: Build APK
+      run: |
+        cd android
+        chmod +x gradlew
+        ./gradlew assembleDebug --no-daemon \
+          -PappVersion=${{ steps.ver.outputs.name }} \
+          -PappVersionCode=${{ steps.ver.outputs.code }}
+        cp app/build/outputs/apk/debug/app-debug.apk \
+           ../CRID-Scanner-${{ steps.ver.outputs.name }}.apk
+
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: crid-apk
+        path: CRID-Scanner-*.apk
+
+  # 自动发布 Release（仅 tag 触发）：合并两芯片构建产物
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, android]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
+        path: rel
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          rel/esp32-ChinaRemoteID_Scan_Sim-esp32s3.zip
+          rel/esp32-ChinaRemoteID_Scan_Sim-esp32c5.zip
+          rel/CRID-Scanner-*.apk
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
+        fail_on_unmatched_files: true
+        body: |
+          ESP32-ChinaRemoteID_Scan_Sim 统一收发固件 ${{ github.ref_name }}
+
+          单固件双模式：发射（GB 42590 / GB 46750 两档）+ 接收监测，
+          连接设备热点（默认 WPA2 口令 sd1471123，网页可改）访问 https://192.168.4.1 在线配置与切换。
+
+          ## 下载
+
+          | 芯片 / 客户端 | 完整包 |
+          |------|--------|
+          | ESP32-S3（N16R8 实测） | `esp32-ChinaRemoteID_Scan_Sim-esp32s3.zip` |
+          | ESP32-C5（N16R8 实测） | `esp32-ChinaRemoteID_Scan_Sim-esp32c5.zip` |
+          | 安卓 App（原生客户端） | `CRID-Scanner-<版本号>.apk` |
+
+          > **安卓 App**：监控 / 地图 / 轨迹 / 配置四页，与网页版功能对齐。
+          > 手机通过蓝牙直连设备，**不连热点也能看实时数据、改配置、删记录**（只有 OTA 升级要求连热点）；
+          > 连上即自动用手机时间给设备授时，之后每 10 分钟补一次。
+          > App 顶部右侧的「检查更新」按钮会自动读本仓库 Release，发现版本号更高就提示下载安装；
+          > 首次安装需允许「安装未知应用」。固件需 v2.0.1 起才支持 App 的写操作（老固件只能读）。
+
+          每个 zip **只含本芯片的产物**，子目录为 `remoteid_scanner_esp32s3/` 或
+          `remoteid_scanner_esp32c5/`，内含 `remoteid_scanner.bin`、`remoteid_scanner.elf`、
+          `bootloader/`、`partition_table/`、`ota_data_initial.bin`。
+
+          ## 烧录（ESP-IDF / esptool 环境）
+
+          **ESP32-S3**（bootloader 偏移 0x0）：
+          ```bash
+          esptool.py --chip esp32s3 --baud 460800 write_flash \
+            0x0 remoteid_scanner_esp32s3/bootloader/bootloader.bin \
+            0x8000 remoteid_scanner_esp32s3/partition_table/partition-table.bin \
+            0x20000 remoteid_scanner_esp32s3/remoteid_scanner.bin
+          ```
+
+          **ESP32-C5**（bootloader 偏移 0x2000，注意与 S3 不同）：
+          ```bash
+          esptool.py --chip esp32c5 --baud 460800 write_flash \
+            0x2000 remoteid_scanner_esp32c5/bootloader/bootloader.bin \
+            0x8000 remoteid_scanner_esp32c5/partition_table/partition-table.bin \
+            0x20000 remoteid_scanner_esp32c5/remoteid_scanner.bin
+          ```
+
+          也可使用 [espressif flash download tool](https://www.espressif.com/en/support/download/other-tools)
+          图形界面烧录（对应芯片型号 + 上表地址）。
+
+          两个芯片均按 **16MB Flash** 构建，分区表为 factory + ota_0 + ota_1（各 2MB）
+          加 4MB 的 ridlog 轨迹日志分区，应用镜像地址是 **0x20000**；烧录本版后即可在
+          网页 https://192.168.4.1 的「固件升级 (OTA)」卡片里直接上传 .bin 升级，不再需要数据线。
+          本 Release 由 CI 自动构建于 ${{ github.ref_name }}，功能说明见仓库 README。
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

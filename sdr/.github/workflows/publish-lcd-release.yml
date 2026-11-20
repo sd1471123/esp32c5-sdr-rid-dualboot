@@ -1,0 +1,62 @@
+name: Publish LCD release
+
+# Publishing the panel firmware goes through GitHub Actions so that no local
+# credential is ever needed: the job uses the repository's own token.
+# Push a c5-lcd-* tag to publish. Older releases are kept so users can always
+# roll back to a previous image; only the release for the tag being published
+# is refreshed (so a re-run is idempotent).
+
+on:
+  push:
+    tags:
+      - 'c5-lcd-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish'
+        required: true
+
+permissions:
+  contents: write
+
+# One publisher at a time so two concurrent runs cannot race to create/refresh
+# the same tag. Queued rather than cancelled, so tags publish in push order.
+concurrency:
+  group: publish-lcd-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Refresh only this tag's release (keep older ones for rollback)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "refreshing existing release $TAG (older releases are kept)"
+            gh release delete "$TAG" --yes --cleanup-tag
+          else
+            echo "no existing release for $TAG; will create"
+          fi
+      - name: Publish the images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "ESP32-C5 LCD panel firmware $TAG" \
+            --notes-file docs/lcd-release-notes.md \
+            firmware/esp32c5-lcd-full.bin \
+            firmware/esp32c5-lcd-app.bin \
+            firmware/esp32c5-lcd-full-4mhz.bin \
+            firmware/esp32c5-lcd-app-4mhz.bin \
+            firmware/esp32c5-lcd-full-diag.bin \
+            firmware/esp32c5-lcd-app-diag.bin \
+            firmware/esp32c5-lcd-pinprobe.bin

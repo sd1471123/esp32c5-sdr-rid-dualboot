@@ -1,0 +1,27 @@
+# ---- ESP-IDF 构建产物 ----
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# 编译/打包输出（本工程脚本生成的 4 个镜像与分区表）
+out/
+
+# ---- 本地参考用上游原始克隆，不入库 ----
+_src_esp_sdr/
+_src_rid/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- 代理工作区数据 ----
+.workbuddy/
+
+# ---- 杂项 ----
+*.log

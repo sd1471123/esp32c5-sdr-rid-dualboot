@@ -1,0 +1,273 @@
+# ESP32-C5 LCD 固件
+
+为 ESP32-C5-DevKitC-1 + 8 针 3.2" 240×320 SPI 屏（GMT032-8P-SPI，**ST7789** 控制器）
++ 5 键 + 有源蜂鸣器编译的 `esp-sdr` 固件（`CONFIG_ESP_SDR_LOCAL_UI=y`）。
+
+面板原生 240×320，固件默认横屏使用（MADCTL `0x60`，坐标空间 320×240），
+按 R 可切回竖屏 240×320。主界面为深色：顶栏（频段 / 模式 / 电平）、频谱 +
+峰值保持、瀑布、底部信道条。
+
+构建时间：2026-11-19，ESP-IDF v6.1，target `esp32c5`。本次重建纳入了 C5 adctrig
+采集时钟修复（省去每次访问 BT 块约 0.8 ms 的总线超时）。
+
+## 三套固件，先选一套
+
+| 镜像 | host 串口 | SPI 时钟 | 用在哪 |
+|---|---|---|---|
+| `esp32c5-lcd-full.bin` / `esp32c5-lcd-app.bin` | UART0 **2 Mbaud** | **8 MHz** | 默认正式版，画面最稳 |
+| `esp32c5-lcd-full-4mhz.bin` / `esp32c5-lcd-app-4mhz.bin` | UART0 **2 Mbaud** | 4 MHz | 8 MHz 花屏时的回退版，其余代码完全相同 |
+| `esp32c5-lcd-full-diag.bin` / `esp32c5-lcd-app-diag.bin` | UART0 **115200** | 4 MHz | 调试期快照，CH340 上能看 `UI tick ...` 电平日志 |
+
+正式版与回退版只差 `LCD_SPI_HZ`。8 MHz 把一帧的写屏时间从约 270 ms 压到
+约 135 ms，是消除撕裂最有效的一招；如果这组杜邦线在 8 MHz 下出现雪花、
+竖线或纯白，直接烧 `esp32c5-lcd-full-4mhz.bin` 回退即可，不用改代码。
+
+正式版与诊断版只差 `CONFIG_ESP_SDR_UART_BAUD`。`ui.c` 里的 `UI_TRACE` 会跟着这个宏自动开关：115200 时往 UART0 打日志，
+2 Mbaud 时静默，否则 UI 文本会混进 host 协议流。USB-Serial-JTAG 口不受影响。
+
+`*-diag.bin` 与正式版是同一份代码，只有 host 波特率不同（115200 vs 2 Mbaud），
+用来在 CH340 上看 `UI tick ...` 的电平日志。
+
+## 文件
+
+| 文件 | 偏移 | 大小 | 说明 |
+|---|---|---|---|
+| `esp32c5-lcd-full.bin` | `0x0` | 943456 | **正式版**合并镜像（8 MHz），一次烧完 |
+| `esp32c5-lcd-app.bin` | `0x10000` | 877920 | 正式版应用（占 1 MB 分区 84%） |
+| `esp32c5-lcd-full-4mhz.bin` | `0x0` | 943472 | 4 MHz 回退合并镜像 |
+| `esp32c5-lcd-app-4mhz.bin` | `0x10000` | 877936 | 4 MHz 回退应用 |
+| `esp32c5-lcd-full-diag.bin` | `0x0` | 945456 | 诊断版合并镜像（115200 + UI 日志） |
+| `esp32c5-lcd-app-diag.bin` | `0x10000` | 879920 | 诊断版应用 |
+| `esp32c5-lcd-pinprobe.bin` | `0x10000` | 136736 | 引脚探针，只烧应用，见下 |
+| `esp32c5-lcd-bootloader.bin` | `0x2000` | 22160 | 二级引导 |
+| `esp32c5-lcd-partition-table.bin` | `0x8000` | 3072 | 分区表 |
+| `esp32c5-lcd-full-ili9341.bin` | `0x0` | 941872 | 早期 ILI9341 试验镜像，仅留档，勿用 |
+
+Flash 2 MB，DIO，80 MHz。`full` 镜像由 `merge_full.py` 把三段按偏移拼成单文件。
+
+## 烧写
+
+> ⚠️ **整片烧录会清空设置。** `esp32c5-lcd-full.bin` 是从 `0x0` 起的连续镜像，
+> `0x8C00`~`0x10000` 之间用 `0xFF` 填充，而 NVS 位于 `0x9000–0xF000`，
+> 于是静音 / 频段 / 模式 / 四套 dB 量程会被一并抹掉。
+
+日常更新（保留设置，推荐）：
+
+```bash
+python -m esptool --chip esp32c5 -p COM6 -b 460800 \
+  --before default-reset --after hard-reset \
+  write-flash --flash-mode dio --flash-size 2MB --flash-freq 80m \
+  0x2000 esp32c5-lcd-bootloader.bin \
+  0x8000 esp32c5-lcd-partition-table.bin \
+  0x10000 esp32c5-lcd-app.bin
+```
+
+只更新应用也可以（同样不动 NVS）：
+
+```bash
+python -m esptool --chip esp32c5 -p COM6 -b 460800 \
+  write-flash 0x10000 esp32c5-lcd-app.bin
+```
+
+首次烧写 / 救砖（**会清设置**）：
+
+```bash
+python -m esptool --chip esp32c5 -p COM6 -b 460800 \
+  --before default-reset --after hard-reset \
+  write-flash --flash-mode dio --flash-size 2MB --flash-freq 80m \
+  0x0 esp32c5-lcd-full.bin
+```
+
+## 从源码构建
+
+正式版（默认 host 2 Mbaud）：
+
+```bash
+export SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c5;sdkconfig.defaults.esp32c5-lcd"
+bash build.sh set-target esp32c5
+bash build.sh build
+cp build/esp_sdr.bin firmware/esp32c5-lcd-app.bin
+python merge_full.py
+```
+
+`merge_full.py` 可带一个输出路径参数，用来生成 4 MHz 回退镜像：把
+`st7789.c` 的 `LCD_SPI_HZ` 临时改成 4000000 重新 build，然后
+`python merge_full.py firmware/esp32c5-lcd-full-4mhz.bin`，改回 8000000 即可。
+
+诊断版：在 `SDKCONFIG_DEFAULTS` 末尾再加一个
+`;sdkconfig.defaults.esp32c5-lcd-diag`，重新 `set-target` + `build`，产物另存为
+`*-diag.bin`。`build.sh` / `_idfwrap.py` 只是剥掉本机 shell 注入的 `MSYSTEM`，
+否则 IDF 6.x 拒绝启动。
+
+## 接线
+
+屏幕排针：`GND VCC SCL SDI RESET AO CS BL`，其中 `AO` 是 A0/DC，`SDI` 是 MOSI（单向写，无 MISO）。
+
+| 屏幕 | ESP32-C5 | 位置 |
+|---|---|---|
+| GND | GND | — |
+| VCC | 3V3 | 右排 1 |
+| SCL | GPIO6 | 右排 7 |
+| SDI | GPIO7 | 右排 8 |
+| RESET | GPIO5 | 左排 9 |
+| AO | GPIO4 | 左排 8 |
+| CS | GPIO10 | 右排 11 |
+| BL | GPIO23 | 左排 5 |
+
+| 功能 | GPIO | 位置 |
+|---|---|---|
+| ← | GPIO0 | 右排 5 |
+| → | GPIO1 | 右排 6 |
+| B（频段） | GPIO8 | 右排 9 |
+| M（模式） | GPIO9 | 右排 10 |
+| R（旋转） | GPIO24 | 左排 4 |
+| 蜂鸣器 | GPIO25 | 右排 13 |
+
+按键对地、内部上拉，低电平有效；蜂鸣器经 NPN（S8050）驱动，基极串 1 kΩ。
+GPIO13/14 是 USB D-/D+，GPIO11/12 是 UART0 控制台，**不要**拿来接屏或按键。
+
+引脚定义在 `main/local_ui/board_c5_lcd.h`，改线只需改这一处。
+
+## 背光电流（务必看）
+
+GMT032 模块的背光是 6 颗 LED，工作电流约 **90–95 mA**，远超单个 GPIO 的
+承受能力（≤40 mA，推荐 20 mA）。**BL 不要直连 GPIO23**，二选一：
+
+- 应急：BL 直接接 3V3，常亮，切断 GPIO23 那根线；
+- 正规：S8050 低边开关，GPIO23 → 1 kΩ → 基极，发射极 GND，集电极接 BL。
+
+## 驱动上踩过的坑（改代码前先看）
+
+- **SPI 8 MHz + DMA**：`LCD_SPI_HZ=8000000` 与 `SPI_DMA_CH_AUTO` 必须成对，
+  还要保留手动 CS 的 2 µs 建立时间。早期 8 MHz **无 DMA** 在这组 15 cm 杜邦线
+  上会丢字节（纯白 / 一根竖线 / GRAM 雪花），当时降到 4 MHz 才稳定。现在 DMA
+  到位后 8 MHz 可用，写屏时间直接减半。若仍花屏，用 `-DLCD_SPI_HZ=4000000`
+  重编，或直接烧 4 MHz 回退镜像。
+- **CS 手动拉**：`spics_io_num=-1`，命令 / 参数 / 像素在同一 CS 窗口内发完，
+  前后各留 2 µs 建立时间。
+- **颜色取反**：这块玻璃对 `INVON/INVOFF` 的表现和预期相反，靠命令调不出深色
+  背景。驱动保留厂商的 `0x21`，但每个像素在发送前用 `LCD_PIX(v) = v ^ 0xffff`
+  软件取反，两次反转抵消。
+- **`LCD_SELFTEST=0`**：出厂自检（纯色 + 棋盘）已关，上电直接进主界面。需要排查
+  接线时把它改成 1 重新编译。
+- **瀑布 64 行环形缓冲**：120 行会吃光内部 RAM，`xTaskCreate` 直接返回 -1，
+  表现为按键切换模式后红蓝屏重启。
+- **频谱是 2-bit 位图，只有 4 个颜色**：为消除曲线闪烁，`render_spectrum()`
+  把整块频谱区合成一张 `mask` 再由 `lcd_draw_bitmap2()` 一次刷出。调色板只有
+  背景 / 网格 / 曲线 / 峰值四色，所以设计稿里半透明的效果一律做不了。曾经
+  传过索引 4 给 `mask_put()`（内部是 `value & 3`），被截成 0，把峰值带下的
+  网格擦成纯黑；现在峰值带改用网格色填充，选框也只画边线。要还原半透明填充
+  必须把 mask 扩到 4-bit（内存 11.2 → 22.4 KB）。
+- **瀑布一次开窗、整块连续写**：原先每行都 `lcd_set_window()` + `lcd_pixels()`，
+  102 次独立 CS 窗口，面板扫描会插在写行之间；LIVE 数据每帧全变时表现为一条
+  从上往下走的接缝。现在 `lcd_set_window()` 只调一次，逐行用
+  `lcd_pixels_cont()`、最后 `lcd_pixels_end()`，CS 全程保持低。同时把环形缓冲
+  索引在帧首冻结（`base = wf_next`），并去掉瀑布绘制途中的 `maybe_acquire()`，
+  避免一帧里上半屏旧数据、下半屏新数据。
+- **频谱也一次开窗刷完**：原先为了给 80 ms 的 SWEEP 步速让路，把
+  `lcd_draw_bitmap2()` 拆成上下两半、中间插一次采集，正好在曲线中间留下一条
+  水平接缝。8 MHz 下整块只要约 69 ms，已能塞进一个步距，所以改回一次发完，
+  采集移到帧边界。
+- **顶栏也是一张位图、一次开窗刷完**：LIVE 每次采集都会刷新 PK / ACT / DET，
+  旧脏检查几乎每帧失效；而重画一次要「先整块清 30 行，再开六七个文字 / 圆角
+  小窗口」，面板扫描总是切在半重建的顶栏中间，所以节流到 500 ms 仍然看得出闪。
+  现在 `render_top()` 把 7×12 大字、模式药丸、数字、静音图标全部合成进复用的
+  2-bit `mask`（4 色：面板 / 文字 / 强调 / 底色），末尾一次
+  `lcd_draw_bitmap2()` 原子替换。节流降到 250 ms，只为不让数字跳得太频繁。
+  副作用：药丸改成方角（四角各挖 1 px 近似圆角），灰字统一用主文字色。
+- **帧周期 300 ms**：一帧约 134 KB，4 MHz 时约 270 ms、8 MHz 时约 135 ms；
+  旧的 120 ms 周期让 `render()` 一返回就开下一帧，屏幕永远没有静止的一刻。
+  SPI 屏没有 VSYNC 和双缓冲，tearing 只能减轻不能根除；采集仍插在帧首、
+  各绘图阶段之间和帧尾，SWEEP 的 80 ms 步速不变。
+
+`main/local_ui/st7789.c` 顶部还留着两个接线排错开关：
+
+| 宏 | 作用 |
+|---|---|
+| `LCD_SWAP_SCL_SDI` | 1 = 按 SCL→GPIO7、SDI→GPIO6 驱动 |
+| `LCD_SWAP_DC_RST` | 1 = 按 RES→GPIO4、AO→GPIO5 驱动 |
+
+## 操作
+
+←/→ 走信道，B 切 2.4G / 5G，M 切 LIVE / SWEEP，R 转屏，← + → 同时按静音。
+SWEEP 每一步实测约 24 ms（42 步/秒），5 GHz 全段 38 步约 **0.9 秒**一轮。
+渲染期间会插空采样按键和射频，所以长按时仍可切模式。底栏 2.4G 按 1–13 等分
+格子，5G 按真实中心频率（36–64 / 100–144 / 149–177）贴边铺满，非等分处留空档。
+
+5 GHz 里没有信道号的几段也画同样的活动度 / 检出率两条，标签用用途名：
+5350–5470 标 `SAT`（卫星主动遥感，约 53 px 宽，整词放得下）；5330–5350 的
+雷达段约 9 px，`RADAR` 放不下，退回首字母 `R`；5730–5735 的 ISM 缝隙约 2 px，
+连一个字母都放不下，只有条。规则是：整词放得下写整词，否则退回首字母，
+宽度不足 7 px 才彻底不写字。
+统计口径与信道一致：段内峰值减全段 20 分位底噪，超 12 dB 记一轮检出。
+
+### 纵轴 dB 量程（组合键）
+
+频率轴在 SWEEP 固定整段、LIVE 是当前 ±10 MHz 窗口；**纵轴两个模式都固定，
+没有自动量程**。
+
+| 操作 | 作用 |
+|---|---|
+| 按住 **B** 再按 ←/→ | 改**当前模式**的上限，5 dB 一格（−80 ~ −10） |
+| 按住 **M** 再按 ←/→ | 改**当前模式**的下限，5 dB 一格（−125 ~ −55） |
+| 长按 **R** 到倒计时结束 | 恢复出厂，四套都回默认 −26 / −105 |
+
+组合键必须**先按 B/M 再按方向键**，反过来不生效。每次调整立刻写 NVS，
+重启后保留；同一模式的上下限始终至少相差 30 dB。
+
+**频段 × 模式共 4 套量程，各自独立、全部固定**：
+
+| 屏幕上的组合 | NVS 键 |
+|---|---|
+| SWEEP @ 5G | `top` / `bot` |
+| LIVE @ 5G | `ltop` / `lbot` |
+| SWEEP @ 2.4G | `top24` / `bot24` |
+| LIVE @ 2.4G | `ltop24` / `lbot24` |
+
+原先 SWEEP 会按「全段 20 分位底噪 + 峰值」平滑调整 `view_top_db`，
+那段自动量程逻辑已整段删除，所以四种组合的曲线和 −40/−60/−80 网格都不会
+再随信号上下漂。想改视野只能用上表组合键。
+
+在哪个组合按组合键就只改那一个键对，**不会牵动另外三种**；切模式、切频段、
+开机、恢复出厂都会立刻切到对应那组值。代价是四个界面要分别调一次。
+
+升级规则：旧固件只存了 `top`/`bot`/`ltop`/`lbot`（不分频段），新固件把它们
+当作 **5G** 的值，并让 2.4G 从 5G 继承一次；之后两边各调各的、互不影响。
+旧 NVS 里残留的 `auto` 键已不再读取，恢复出厂时会一起清掉。
+
+其它状态：`band` / `mode` / `landscape` / `buzz` / `mute` 都会存；**当前信道
+不存**，每次开机回中间（5G ch104 / 2.4G ch7）。
+
+SWEEP（以及连接上位机）时频谱上会用琥珀色边线框出当前信道的 **20 MHz 范围**，
+两条竖边 + 上下亮边，x 坐标由 `strip_x()` 计算，与底栏选中游标严格对齐。设计稿
+是半透明青色填充 + 描边，固件受 4 色调色板限制只保留边线；LIVE 模式不画框，
+改为中心虚线。5G 全段 725 MHz 时这个框只有约 9 px 宽，2.4G 全段 80 MHz 时约 80 px，
+是真实频率比例，不是画错了。
+
+## 引脚探针（查丝印、查按键接线）
+
+`esp32c5-lcd-pinprobe.bin` 是不启动射频、不初始化屏幕的独立小工程
+（`CONFIG_ESP_SDR_PIN_PROBE`）。把所有排针 GPIO 设成上拉输入，拿一根 GND 线
+去碰任意针，蜂鸣器把这个针的 **GPIO 号**报出来。探测表已剔除
+13/14（USB）和 11/12（console）。
+
+只烧这一支，不碰 bootloader 和分区表：
+
+```bash
+python -m esptool --chip esp32c5 -p COM8 -b 460800 \
+  write-flash --flash-mode dio --flash-size 2MB --flash-freq 80m \
+  0x10000 esp32c5-lcd-pinprobe.bin
+```
+
+退回正常固件：重新烧 `esp32c5-lcd-full.bin` 即可。
+
+**报号规则**：400 ms 长音开头 → 十位（每声 160 ms）→ 停 600 ms → 个位，
+末尾单独一声 700 ms 长音表示 0。开机先响 3 声短音表示活着；什么都没碰就
+自己报号，说明那些脚上电时已被短到 GND。
+
+| 听到 | 是 |
+|---|---|
+| 2 声、停、4 声 | GPIO24 |
+| 6 声（中间不停） | GPIO6 |
+| 1 声、停、一声长音 | GPIO10 |
+| 一声长音 | GPIO0 |

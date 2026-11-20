@@ -1,0 +1,3556 @@
+/**
+ * @file crid_web.c
+ * @brief 内置配置网页服务器：手机连接热点后访问 https://192.168.4.1
+ *        可在线修改 UAS ID / 坐标 / 高度 / 速度 / 巡游参数 / 热点参数
+ */
+
+#include "crid_web.h"
+#include "crid_wifi.h"
+#include "crid_rx.h"
+#include "esp_https_server.h"
+#include "crid_gb46750.h"
+#include "crid_time.h"
+#include "crid_ota.h"
+#include "crid_log.h"
+#include "page_gz.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "cJSON.h"
+#include <string.h>
+#include <stdlib.h>
+
+static const char *TAG = "CN_C-RID_WEB";
+
+
+static cn_crid_config_t *s_config = NULL;
+
+// 由 crid-sim.c 提供：模式/标准切换后的运行时应用
+extern void crid_app_apply_mode(void);
+
+// ================================================================
+// 内置网页（全部使用单引号，避免 C 字符串转义）
+// 地图双模式：手机有蜂窝数据时加载 Leaflet+OSM 在线地图选点；
+// CDN 不可达时自动降级为内置离线网格拾取器（以当前基准点为中心）。
+// ================================================================
+static const char PAGE_HTML[] =
+"<!DOCTYPE html><html lang='zh'><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>ESP32-ChinaRemoteID_Scan_Sim</title>"
+"<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>"
+"<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js' onerror='window._mapfail=1'></script>"
+"<style>"
+"*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}"
+"body{font-family:-apple-system,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;"
+"margin:0;background:#eef1f5;color:#1f2937;line-height:1.5;overflow-x:hidden}"
+".hdr{background:linear-gradient(135deg,#0b3d2e,#0f8a4d);color:#fff;padding:10px 16px}"
+".hdr-in{max-width:1080px;margin:0 auto}"
+// 顶部：第一行左边项目名、右边「固件升级」入口；仓库地址与副标题各占整行，
+// 这样窄屏下地址有整屏宽度可用，不必折行（折行的 url 很难看且读不出来）
+".hdr-row{display:flex;align-items:flex-start;gap:10px;position:relative}"
+// 标题列就是普通流：按钮改成绝对定位挂在右上角，不参与这一行的高度。
+// 否则按钮两行比标题高，行被撑高，标题与地址之间就凭空多出一行空白。
+".hdr-tt{flex:1;min-width:0}"
+// 项目名只在「_Scan_Sim」前留一个断点（<wbr>）：手机窄屏下断成
+// 「ESP32-ChinaRemoteID」+「_Scan_Sim」两行，不会把 ID 拆到中间。
+// padding-right 给右上角按钮让位，标题永远不会压到按钮上。
+".hdr h2{margin:0;padding-right:72px;font-size:17px;line-height:1.28;display:flex;"
+"align-items:flex-start;gap:8px;overflow-wrap:break-word}"
+".dot{width:10px;height:10px;border-radius:50%;background:#4ade80;display:inline-block;"
+"box-shadow:0 0 6px #4ade80;flex:none;margin-top:6px}"
+".hdr-nm{min-width:0}"
+".hdr-url{display:block;margin-top:1px;font-size:11px;color:#b8ecd2;text-decoration:none;"
+"font-family:ui-monospace,Menlo,Consolas,monospace;white-space:nowrap;overflow:hidden;"
+"text-overflow:ellipsis}"
+".hdr-url:hover{color:#fff;text-decoration:underline}"
+".hdr .sub{margin:1px 0 0;font-size:11px;opacity:.78}"
+// 右上角入口：上「固件升级」下版本号，两行居中；绝对定位，不影响标题行高
+".hdr-ota{position:absolute;top:0;right:0;width:auto;margin:0;padding:4px 9px;"
+"border-radius:8px;font-size:11px;"
+"font-weight:700;font-family:inherit;color:#0b3d2e;background:rgba(255,255,255,.93);"
+"border:1px solid rgba(255,255,255,.5);box-shadow:0 1px 3px rgba(0,0,0,.16);"
+"display:flex;flex-direction:column;align-items:center;gap:0;line-height:1.15}"
+".hdr-ota .ota-v{font-size:9.5px;font-weight:600;color:#0f8a4d;"
+"font-family:ui-monospace,Menlo,Consolas,monospace}"
+".hdr-ota:active{transform:scale(.97);background:#fff;filter:none}"
+".wrap{max-width:1080px;margin:0 auto;padding:14px}"
+".grid{display:grid;grid-template-columns:1fr;gap:14px}"
+// 网格子项默认 min-width:auto，内部一旦有不可断行的长字符串（很长的机型名、
+// 序列号），整列会被撑得比屏幕还宽，页面横向溢出，底部按钮就跑到屏幕外。
+// 统一给 0 让子项可以收缩，长文本交给 overflow-wrap 断行。
+".grid>*{min-width:0}"
+".col{display:flex;flex-direction:column;gap:14px;min-width:0}"
+// 列尾卡片拉伸补齐，两列强制等高
+".col>.card:last-child{flex:1 1 auto}"
+".card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 1px 4px rgba(16,24,40,.08)}"
+".card h3{margin:0 0 4px;font-size:15px;color:#0b3d2e;display:flex;align-items:center;gap:7px}"
+".card h3::before{content:'';width:4px;height:14px;border-radius:2px;background:#0f8a4d;flex:none}"
+"label{display:block;font-size:12px;color:#6b7280;margin-top:10px;font-weight:600}"
+"input,select{width:100%;padding:9px 10px;margin-top:4px;border:1px solid #d1d5db;"
+"border-radius:8px;font-size:15px;background:#f9fafb;color:#1f2937;transition:.15s}"
+"input:focus,select:focus{outline:none;border-color:#0f8a4d;background:#fff;"
+"box-shadow:0 0 0 3px rgba(15,138,77,.15)}"
+".g{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}"
+// 同一行两格高度由较高的那格决定：标签文字长短不同（如「Wi-Fi 信道」在
+// 5.8G 时变长会折成两行）会让右侧输入框被顶下去，看起来就是两格没对齐。
+// 让每格成为纵向 flex、标签吃掉多余高度并底部对齐，输入框就始终齐平。
+".g>div{display:flex;flex-direction:column;min-width:0}"
+".g>div>label{flex:1 0 auto;display:flex;align-items:flex-end}"
+".g .full{grid-column:1/-1}"
+".note{font-size:12px;color:#9ca3af;margin:6px 0 0}"
+// 说明信息默认折叠：details/summary 原生控件，零 JS，点开才展开完整文字
+"details.tip{margin:8px 0 0;background:#f7f9fa;border:1px solid #e6eaee;border-radius:8px}"
+"details.tip>summary{list-style:none;cursor:pointer;padding:7px 10px;display:flex;"
+"align-items:center;gap:6px;font-size:12px;font-weight:600;color:#0f8a4d}"
+"details.tip>summary::-webkit-details-marker{display:none}"
+"details.tip>summary::after{content:'\\25BE';margin-left:auto;font-size:10px;"
+"color:#9ca3af;transition:.15s}"
+"details.tip[open]>summary::after{transform:rotate(180deg)}"
+"details.tip>div{padding:0 10px 9px;font-size:12px;color:#6b7280;line-height:1.7}"
+"details.tip>div b{color:#0b3d2e}"
+"#map{height:320px;border-radius:10px;border:1px solid #e5e7eb;z-index:0}"
+"#grid{width:100%;border-radius:10px;border:1px solid #e5e7eb;touch-action:manipulation}"
+".seg{display:flex;gap:8px;margin:8px 0 10px}"
+".seg label{margin:0;flex:1}"
+".seg input{display:none}"
+".seg span{display:flex;align-items:center;justify-content:center;text-align:center;"
+"min-height:37px;padding:6px 8px;border-radius:8px;line-height:1.25;"
+"border:1px solid #d1d5db;font-size:14px;font-weight:600;color:#374151;"
+"background:#f9fafb;cursor:pointer;transition:.15s}"
+".seg input:checked+span{background:#0f8a4d;border-color:#0f8a4d;color:#fff}"
+".lbl{display:block;font-size:12px;color:#6b7280;margin:0 0 4px}"
+".ckl{display:flex;align-items:center;gap:8px;cursor:pointer;margin:0;padding:8px 10px;"
+"background:#f7f8fa;border:1px solid #e3e6ea;border-radius:8px}"
+".ckl input{display:none}"
+".ckl i{width:36px;height:20px;background:#cfd6df;border-radius:10px;position:relative;"
+"transition:.15s;flex:none}"
+".ckl i:after{content:'';position:absolute;left:2px;top:2px;width:16px;height:16px;"
+"background:#fff;border-radius:50%;transition:.15s}"
+".ckl input:checked+i{background:#0f8a4d}"
+".ckl input:checked+i:after{left:18px}"
+".ckl b{font-weight:600;font-size:12px;color:#6b7280}"
+".ckl input:checked~b{color:#0f8a4d}"
+".ckl.off{opacity:.4;pointer-events:none}"
+".mpp{margin-top:10px}"
+".dd{position:relative}"
+".dd-btn{display:flex;justify-content:space-between;align-items:center;width:100%;"
+"padding:9px 12px;margin-top:4px;border:1px solid #d1d5db;border-radius:8px;"
+"background:#f9fafb;font-size:15px;color:#374151;cursor:pointer;transition:.15s;text-align:left}"
+".dd-btn:hover{border-color:#0f8a4d}"
+".dd.open .dd-btn{border-color:#0f8a4d;background:#fff;box-shadow:0 0 0 3px rgba(15,138,77,.15)}"
+".dd-txt.ph{color:#9ca3af}"
+".dd-car{color:#6b7280;font-size:12px;transition:.2s}"
+".dd.open .dd-car{transform:rotate(180deg)}"
+".dd-panel{display:none;position:absolute;z-index:60;left:0;right:0;top:calc(100% + 4px);"
+"background:#fff;border:1px solid #e5e7eb;border-radius:10px;"
+"box-shadow:0 8px 24px rgba(16,24,40,.16);overflow:hidden}"
+".dd.open .dd-panel{display:block}"
+".dd-list{max-height:240px;overflow-y:auto;padding:4px;-webkit-overflow-scrolling:touch}"
+".dd-group{font-size:11px;font-weight:700;color:#9ca3af;padding:8px 10px 2px}"
+".dd-item{padding:9px 10px;border-radius:7px;font-size:14px;color:#1f2937;cursor:pointer}"
+".dd-item:hover{background:#ecfdf5;color:#0b3d2e}"
+"#liveinfo{font-size:12px;color:#1565c0;margin-top:8px;min-height:14px;"
+"font-family:monospace;background:#eff6ff;border-radius:6px;padding:5px 8px}"
+"#tstat{font-size:12px;margin:2px 0 8px;padding:5px 8px;border-radius:6px;"
+"font-family:monospace;background:#fff7ed;color:#b45309;border:1px solid #fed7aa}"
+"#tstat.ok{background:#ecfdf5;color:#0f8a4d;border-color:#a7f3d0}"
+"#tstat.bad{background:#fef2f2;color:#b91c1c;border-color:#fecaca}"
+"#hint{font-size:12px;color:#9ca3af;margin-top:8px}"
+// ---- 接收监测 ----
+".rxbar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 4px}"
+".chip{flex:1 1 76px;min-width:76px;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:10px;"
+"padding:8px 6px;text-align:center}"
+".chip b{display:block;font-size:18px;color:#0b3d2e;line-height:1.25;font-variant-numeric:tabular-nums}"
+".chip span{display:block;font-size:11px;color:#8b95a1;margin-top:2px}"
+".chip.on b{color:#0f8a4d}"
+".chip.warn b{color:#c0392b}"
+".rxbanner{display:flex;align-items:center;gap:8px;font-size:12px;color:#6b7280;margin:12px 0 8px}"
+".rxbanner .dot{width:8px;height:8px}"
+".rxbanner .dot.live{animation:pulse 1.2s infinite}"
+"@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}"
+".rxlist{display:flex;flex-direction:column;gap:9px;min-width:0}"
+".rxsec{font-size:12px;font-weight:700;color:#0f8a4d;margin:2px 0 -4px;letter-spacing:.3px}"
+".rxsec.dim{color:#9ca3af}"
+".dcard{border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;background:#fff;"
+"min-width:0;box-shadow:0 1px 3px rgba(16,24,40,.06)}"
+".dcard.hot{border-color:#f0b6ae;box-shadow:0 1px 6px rgba(192,57,43,.12)}"
+// 离线目标卡片：整体灰度弱化，与在线目标一眼区分
+".dcard.off{filter:grayscale(1);opacity:.62}"
+// 卡片头：UAS ID + 协议/状态标签 + 信号柱，整行高度压到最小
+".dh{display:flex;align-items:center;gap:7px;padding:6px 10px;background:#f6f8fa;"
+"border-bottom:1px solid #e5e7eb}"
+".dh .id{flex:1;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+"font-size:13px;font-weight:700;color:#111827;letter-spacing:.2px;overflow:hidden;"
+"text-overflow:ellipsis;white-space:nowrap}"
+".tag{flex:none;font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;line-height:1.6}"
+".tag.g42590{background:#e0f2fe;color:#075985}"
+".tag.g46750{background:#ede9fe;color:#5b21b6}"
+".tag.astm{background:#f1f5f9;color:#475569}"
+".tag.air{background:#dcfce7;color:#166534}"
+".tag.pend{background:#fef3c7;color:#92400e}"
+".sig{flex:none;display:flex;align-items:flex-end;gap:2px;height:14px}"
+".sig i{width:3px;background:#d1d5db;border-radius:1px;display:block}"
+".sig i.on{background:#0f8a4d}"
+".sig i.on.w{background:#eab308}"
+".sig i.on.weak{background:#c0392b}"
+".db{padding:7px 10px 8px;min-width:0}"
+// 机型标题行：左＝机型名，右＝「链路与统计」（MAC / RSSI / 帧数 / 最后收到）。
+// 原来链路信息独占一整行格子，现在并进标题行，展开前高度省一行。
+// 机型名来自对方广播、长度不可控：可收缩 + 任意断行，链路串超宽则换行仍右对齐。
+".dname{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;"
+"font-size:13px;color:#0b3d2e;font-weight:600;margin-bottom:1px}"
+".dname .nm{min-width:0;overflow-wrap:anywhere;word-break:break-word}"
+".dname .lnk{margin-left:auto;max-width:100%;overflow:hidden;text-overflow:ellipsis;"
+"white-space:nowrap;font-size:10px;font-weight:500;color:#8b95a1;letter-spacing:-.1px;"
+"font-family:ui-monospace,Menlo,Consolas,monospace}"
+".kv{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;margin-top:7px;"
+"background:#e5e7eb;border:1px solid #e5e7eb;border-radius:9px;overflow:hidden}"
+".kv div{background:#fff;padding:5px 7px;min-width:0}"
+".kv b{display:block;font-size:13px;color:#111827;font-weight:700;"
+"font-variant-numeric:tabular-nums;line-height:1.3}"
+".kv b small{font-size:9px;font-weight:600;color:#9ca3af;margin-left:2px}"
+".kv span{display:block;font-size:9px;color:#8b95a1}"
+".kv .hl b{color:#0a7d43}"
+// 副信息行：飞手位置与实名登记号并列一行（飞手坐标占主列，实名登记号按内容宽度收窄）
+".kv2{display:grid;grid-template-columns:1fr auto;gap:1px;margin-top:6px;"
+"background:#e5e7eb;border:1px solid #e5e7eb;border-radius:9px;overflow:hidden}"
+".kv2 div{background:#f9fafb;padding:4px 7px;min-width:0}"
+".kv2 div.wide{grid-column:1/-1}"
+".kv2 b{display:block;font-size:11px;color:#1f2937;font-weight:700;"
+"font-variant-numeric:tabular-nums;line-height:1.35;overflow-wrap:anywhere}"
+".kv2 span{display:block;font-size:9px;color:#8b95a1}"
+// ---- 导航按钮：跳转手机地图 App（高德/百度），点卡片自身仍做地图聚焦 ----
+".navrow{display:flex;gap:8px;margin-top:7px;flex-wrap:wrap}"
+".navbtn{flex:1;min-width:118px;padding:7px 10px;font-size:12px;font-weight:700;"
+"font-family:inherit;color:#0b3d2e;background:#eefaf3;border:1px solid #bbe6cf;"
+"border-radius:9px;cursor:pointer;line-height:1.3}"
+".navbtn:active{transform:scale(.98);background:#dff5e9}"
+".navbtn[data-nav=op]{color:#7c2d12;background:#fff5ec;border-color:#f5cfae}"
+".navbtn[data-nav=op]:active{background:#ffe9d5}"
+// 导航地图选择层：点「导航到…」按钮时才弹出，不占页面空间
+".navmask{position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;display:none;"
+"background:rgba(17,24,39,.45)}"
+".navmask.on{display:flex;align-items:flex-end;justify-content:center}"
+".navsheet{width:100%;max-width:460px;background:#fff;border-radius:14px 14px 0 0;"
+"padding:14px 14px 16px;box-shadow:0 -6px 24px rgba(0,0,0,.18)}"
+".navsheet h4{margin:0;font-size:15px;color:#111827}"
+".navsheet .sub{margin:3px 0 12px;font-size:11px;color:#8b95a1;"
+"font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}"
+".navopt{display:block;width:100%;text-align:left;margin-bottom:8px;padding:11px 12px;"
+"font-family:inherit;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;"
+"cursor:pointer}"
+".navopt:active{transform:scale(.99);background:#eefaf3;border-color:#bbe6cf}"
+".navopt b{display:block;font-size:14px;color:#0b3d2e}"
+".navopt span{display:block;font-size:11px;color:#8b95a1;margin-top:2px}"
+".navcancel{width:100%;padding:11px;font-family:inherit;font-size:13px;font-weight:600;"
+"color:#6b7280;background:#fff;border:1px solid #e5e7eb;border-radius:10px;cursor:pointer}"
+// ---- 报文详情折叠区与一键展开/折叠按钮 ----
+".fbtn{flex:none;background:#fff;border:1px solid #d1d5db;border-radius:8px;"
+"padding:6px 10px;font-size:12px;color:#0b3d2e;font-weight:600;cursor:pointer}"
+".fbtn:active{transform:scale(.97)}"
+".dtl{margin-top:9px;border-top:1px dashed #e5e7eb}"
+".dtl-h{display:flex;align-items:center;gap:5px;padding:5px 2px 0;"
+"font-size:11px;font-weight:700;color:#0f8a4d;cursor:pointer;user-select:none}"
+".dtl-h i{font-style:normal;font-size:10px;color:#9ca3af;transition:.15s}"
+".dcard.open .dtl-h i{transform:rotate(90deg)}"
+".dtl-b{display:none;padding:6px 2px 2px}"
+".dcard.open .dtl-b{display:block}"
+".dtab{width:100%;border-collapse:collapse;font-size:11px}"
+".dtab td{padding:4px 6px;border-bottom:1px dashed #f0f1f3;vertical-align:top}"
+".dtab td:first-child{color:#8b95a1;white-space:nowrap;width:38%}"
+".dtab td:last-child{color:#1f2937;font-family:ui-monospace,Menlo,Consolas,monospace;"
+"word-break:break-all}"
+".rxb0{text-align:center;padding:22px 10px;color:#9ca3af;font-size:13px;"
+"background:#fafbfc;border:1px dashed #d1d5db;border-radius:12px}"
+".rxb0 b{display:block;font-size:26px;margin-bottom:4px;opacity:.5}"
+"@media(min-width:560px){.kv{grid-template-columns:repeat(6,1fr)}"
+".kv .wide{grid-column:span 6}}"
+// ---- 接收地图 ----
+// z-index:0 让 .mapbox 自成层叠上下文：Leaflet 内部图层的 z-index 高达 200-800，
+// 若不隔离就会盖住页面上的 fixed 弹层（导航选择层曾因此被地图压住）
+".mapbox{position:relative;z-index:0;height:340px;border:1px solid #e5e7eb;border-radius:12px;"
+"overflow:hidden;margin:10px 0 4px;background:#e8edf2}"
+"#rxmap{position:absolute;inset:0}"
+// 接收端离线网格：与发射端同样的 canvas 网格底图，热点无互联网时仍可看相对位置
+"#rxgrid{display:none;width:100%;border-radius:10px;background:#fafafa}"
+".rxoff{margin-top:8px;font-size:11px;color:#6b7280;line-height:1.6}"
+".mapleg{position:absolute;left:8px;bottom:8px;z-index:500;background:rgba(255,255,255,.92);"
+"border:1px solid #e5e7eb;border-radius:8px;padding:5px 8px;font-size:11px;color:#4b5563;"
+"display:flex;gap:10px;align-items:center}"
+".mapleg i{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:4px;vertical-align:-1px}"
+".mapbtn{position:absolute;right:8px;top:8px;z-index:500;border:1px solid #e5e7eb;"
+"background:rgba(255,255,255,.95);border-radius:8px;padding:5px 10px;font-size:12px;"
+"color:#0b3d2e;font-weight:600;cursor:pointer}"
+".mapbtn:active{background:#f3f4f6}"
+// 底部动作栏：等分网格（不再用 flex:1 + 34% 混排）。
+// 混排时两按钮宽度之和含 gap 后容易超出容器，窄屏上会顶出右边界。
+".actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;min-width:0}"
+".actions>button{width:100%;min-width:0}"
+"button{padding:13px 8px;border:0;border-radius:10px;cursor:pointer;transition:.15s;"
+"background:linear-gradient(135deg,#0f8a4d,#0a7d43);color:#fff;font-size:16px;font-weight:600;"
+"font-family:inherit}"
+"button:hover{filter:brightness(1.08)}"
+"button:active{transform:scale(.98)}"
+"button.danger{background:#fff;color:#c0392b;border:1px solid #f3b6b0}"
+"button.danger:hover{background:#fdf1f0;filter:none}"
+// ---- 历史轨迹（接收记录持久化） ----
+// 卡片标题兼折叠开关：点一下收起/展开，右侧箭头指示当前状态
+".lghd{cursor:pointer;-webkit-user-select:none;user-select:none}"
+".lghd .tog{margin-left:8px;font-style:normal;font-size:11.5px;font-weight:600;color:#0f8a4d;"
+"background:#eef7f1;border:1px solid #cfe8db;border-radius:12px;padding:2px 9px;flex:none;"
+"letter-spacing:0}"
+".lghd .tog:after{content:'\\25BE';margin-left:4px;font-size:9px}"
+".lghd.open .tog:after{content:'\\25B4'}"
+// 记录开关：默认关闭，用户拨一次就存进 NVS，授时不再自动打开它
+".lgsw{margin-left:auto;flex:none;font-family:inherit;font-size:11.5px;font-weight:600;"
+"color:#9a6b00;background:#fff8e6;border:1px solid #f0d8a0;border-radius:12px;"
+"padding:2px 9px;cursor:pointer;letter-spacing:0}"
+".lgsw.on{color:#0f8a4d;background:#eef7f1;border-color:#cfe8db}"
+// 蓝牙取数条：连上后 /api 查询全走 BLE，Wi-Fi 可以腾出来
+".blebar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 2px;"
+"padding:7px 10px;background:#f4f7fb;border:1px solid #dae4f0;border-radius:8px;"
+"font-size:12px;color:#41597a}"
+".blebar.on{background:#eef7f1;border-color:#cfe8db;color:#0f6a48}"
+".blebar .bfbtn{margin-left:auto;flex:none;font-family:inherit;font-size:11.5px;font-weight:600;"
+"color:#0b3d2e;background:#fff;border:1px solid #cfd8e3;border-radius:12px;"
+"padding:3px 10px;cursor:pointer}"
+".blebar .bfbtn:active{transform:scale(.97)}"
+".blebar .blenk{text-decoration:none;line-height:1.45}"
+".lgbar{height:8px;border-radius:5px;background:#eef1f4;overflow:hidden;margin:10px 0}"
+".lgbar i{display:block;width:0;height:100%;background:#1565c0;transition:width .3s}"
+".lgrow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #e5e7eb;"
+"border-radius:10px;background:#fbfcfe;font-size:13px;min-width:0;flex-wrap:wrap}"
+".lgrow.sel{border-color:#1565c0;background:#eff6ff}"
+".lgrow .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#475569}"
+".lgrow .id{font-weight:600;color:#111827;overflow:hidden;text-overflow:ellipsis;"
+"white-space:nowrap;max-width:100%}"
+".lgrow .sp{flex:1 1 16px}"
+".lgrow .mini{font-size:11px;color:#8b95a1}"
+".lgrow button{width:auto;margin:0;padding:6px 10px;font-size:12px;flex:0 0 auto}"
+// 单目标删除：低调的红边，别和「看轨迹」抢注意力
+".lgrow .lgdel{color:#b3261e;border-color:#f0c9c5;background:#fdf4f3}"
+".lgrow .lgdel:active{transform:scale(.97)}"
+// 轨迹点表格：每列按内容定宽（不再用 1fr，否则经纬度会被拉成一整片空白），
+// 数字列右对齐，小数点自然对齐
+".lgpt{display:grid;align-items:center;gap:6px;font-size:12px;padding:6px 8px;"
+"border-bottom:1px solid #eef2f7;justify-content:start;"
+"grid-template-columns:112px 84px 94px 72px 82px 50px}"
+".lgpt>span:nth-child(n+4){text-align:right}"
+".lgpt.hd{font-weight:700;color:#475569;background:#f4f7fb;border-bottom-color:#dde5ef;"
+"border-radius:6px 6px 0 0}"
+".lgpt.cur{background:#fff8e6;box-shadow:inset 3px 0 0 #f0a020}"
+".lgpt .mono{font-family:ui-monospace,Menlo,Consolas,monospace;letter-spacing:-.2px}"
+".lgpt .dim{color:#8b95a1}"
+".lgpt>span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+// 窄屏（手机）：表头藏起来，每行改两行排——上一行时间+纬+经，下一行高度/速度/航向，
+// 用 data-l 前缀代替列名，经纬度才不会和高度挤在一格里
+".lgpt>span[data-l]:before{content:attr(data-l);color:#9aa5b1;display:none}"
+"@media(max-width:620px){"
+".lgpt{grid-template-columns:auto auto minmax(0,1fr);gap:2px 10px;padding:7px 9px;"
+"grid-template-areas:'t lat lon' 'alt spd trk'}"
+".lgpt.hd{display:none}"
+".lgpt>span:nth-child(1){grid-area:t}"
+".lgpt>span:nth-child(2){grid-area:lat}"
+".lgpt>span:nth-child(3){grid-area:lon}"
+".lgpt>span:nth-child(4){grid-area:alt}"
+".lgpt>span:nth-child(5){grid-area:spd}"
+".lgpt>span:nth-child(6){grid-area:trk}"
+".lgpt>span[data-l]:before{display:inline}"
+".lgpt>span:nth-child(n+4){text-align:left}"
+".lgpt .dt{display:none}"
+".lgmap{height:230px}"
+"}"
+".lgmore{font-size:12px;color:#6b7280;padding:8px 2px}"
+// 轨迹详情：标题行 + 地图 + 回放控制 + 分页
+".lgdet{margin-top:12px;border-top:1px dashed #dbe3ec;padding-top:10px}"
+".lgdhd{display:flex;align-items:center;gap:8px;margin-bottom:8px}"
+".lgdhd .who{flex:1;min-width:0;font-size:12.5px;font-weight:600;color:#111827;"
+"overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+".lgdhd button{width:auto;margin:0;padding:5px 10px;font-size:12px;background:#fff;"
+"color:#6b7280;border:1px solid #d8dee6;border-radius:7px;box-shadow:none;flex:none}"
+".lgmap{height:250px;width:100%;display:block;border-radius:10px;border:1px solid #e5e7eb;"
+"background:#f4f7fb;z-index:0}"
+"canvas.lgmap{touch-action:manipulation}"
+".lgctl{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}"
+".lgctl button{width:auto;margin:0;padding:6px 13px;font-size:12px;border-radius:8px;flex:0 0 auto}"
+".lgctl .spd{display:flex;align-items:center;gap:5px;font-size:12px;color:#4b5563;margin:0}"
+".lgctl select{width:auto;margin:0;padding:5px 6px;font-size:12px;border-radius:7px;"
+"border:1px solid #d1d5db;background:#fff;font-family:inherit}"
+".lgctl .now{flex:1 1 100%;font-size:11.5px;color:#1565c0;font-family:ui-monospace,Menlo,"
+"Consolas,monospace;min-height:15px}"
+".lgpage{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin:12px 0 8px}"
+".lgpage button{width:auto;margin:0;padding:5px 9px;font-size:12px;border-radius:7px;"
+"min-width:32px;background:#fff;color:#374151;border:1px solid #d8dee6;box-shadow:none;"
+"font-weight:600;flex:0 0 auto}"
+".lgpage button.on{background:#1565c0;border-color:#1565c0;color:#fff}"
+".lgpage button:disabled{opacity:.35;pointer-events:none}"
+".lgpage .info{flex:1 1 100%;font-size:11.5px;color:#8b95a1}"
+"#msg{margin-top:10px;font-size:14px;min-height:18px;font-weight:600}"
+// 没有提示信息时不占高度，避免按钮与页脚之间凭空多出一行空白
+"#msg:empty{display:none}"
+// ---- 固件升级（OTA） ----
+".otainfo{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:#4b5563;"
+"background:#f7f9fa;border:1px solid #e6eaee;border-radius:8px;padding:7px 10px;margin-top:8px}"
+".otainfo b{color:#0b3d2e;font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace}"
+".otafile{display:flex;gap:8px;align-items:center;flex-wrap:wrap}"
+".otafile input[type=file]{flex:1 1 200px;min-width:0;margin-top:0;padding:7px 8px;"
+"font-size:13px;background:#fff}"
+".otafile button{flex:0 0 auto;width:auto;margin-top:0;padding:10px 16px;font-size:14px}"
+"button:disabled{opacity:.55;cursor:not-allowed;filter:none}"
+".otabar{display:none;height:10px;border-radius:6px;background:#eef1f4;"
+"overflow:hidden;margin-top:10px}"
+".otabar.on{display:block}"
+".otabar i{display:block;width:0;height:100%;border-radius:6px;"
+"background:linear-gradient(90deg,#0f8a4d,#16a35f);transition:width .18s}"
+".otatxt{font-size:12px;color:#6b7280;margin-top:6px;min-height:16px;line-height:1.5}"
+".otatxt.bad{color:#c0392b}"
+".otatxt.good{color:#0a7d43}"
+".foot{font-size:12px;color:#9ca3af;margin:10px 2px}"
+// 窄屏（小屏手机）把地址与副标题再收一点字号，保证整条 url 一行放得下
+"@media(max-width:400px){"
+".hdr{padding:9px 14px}"
+".hdr h2{font-size:16px}"
+".hdr-url{font-size:10px;letter-spacing:-.2px}"
+".hdr-ota{padding:5px 9px}"
+"}"
+"@media(min-width:860px){"
+".grid{grid-template-columns:1fr 1fr}"
+".span2{grid-column:1/-1}"
+"#map{height:460px}"
+"}"
+"</style></head><body>"
+"<div class='hdr'><div class='hdr-in'><div class='hdr-row'>"
+"<div class='hdr-tt'>"
+"<h2><span class='dot'></span><span class='hdr-nm'>ESP32-ChinaRemoteID<wbr>_Scan_Sim</span></h2>"
+"</div>"
+"<button class='hdr-ota' id='otatoggle' type='button' onclick='otaOpen()'>"
+"<span>固件升级</span><span class='ota-v' id='otavh'>v--</span></button>"
+"</div>"
+"<a class='hdr-url' href='https://github.com/sd1471123/esp32-ChinaRemoteID_Scan_Sim'"
+" target='_blank' rel='noopener'>github.com/sd1471123/esp32-ChinaRemoteID_Scan_Sim</a>"
+"<p class='sub'>中国 Remote ID 收发一体固件 · GB 42590-2023 / GB 46750-2025</p>"
+"</div></div>"
+"<div class='wrap'><div class='grid'>"
+"<div class='card span2'><h3>运行模式</h3>"
+// 授时状态条放在「运行模式」框架内：发射与接收两种角色下都常驻可见，
+// 不用切回发射页也能确认设备时钟是否已校准。
+"<div id='tstat'>时间未校准 · 报文时间字段按「未知」发送</div>"
+"<span class='lbl'>工作角色（拨动选择，单射频二选一）</span>"
+"<div class='seg'>"
+"<label><input type='radio' name='role' value='rx'><span>接收<br>监听周边</span></label>"
+"<label><input type='radio' name='role' value='tx'><span>发射<br>RID 广播</span></label>"
+"</div>"
+"<div id='bandbox'>"
+"<span class='lbl'>Wi-Fi 频段（单射频，二选一）</span>"
+"<div class='seg'>"
+"<label><input type='radio' name='band' value='0' checked><span>2.4 GHz</span></label>"
+"<label id='b5gl'><input type='radio' name='band' value='1'><span>5.8 GHz</span></label>"
+"</div>"
+"</div>"
+"<details class='tip'><summary>说明：为什么射频信号只能二选一</summary><div>"
+"本机只有<b>一条射频链路</b>，同一时刻只能发或只能收。发射时射频忙于发出 Beacon（携带 RID 报文），"
+"这段时间到达的信号收不到；接收时射频一直在监听，就没有空口资源稳定广播。"
+"所以「又发又收」在单射频硬件上只能是分时轮转，会互相抢时间、掉帧，不如明确二选一。"
+"<br>热点本身<b>始终开启</b>，与射频信号怎么用无关，手机随时可以连进来改参数。"
+"<span id='bandln'><br>2.4G 与 5.8G 也共用同一射频，只能启用一个频段；切换频段会重建热点，手机需重新连接。</span>"
+"</div></details>"
+"<div id='stdbox'>"
+"<label>广播标准</label>"
+"<div class='seg'>"
+"<label><input type='radio' name='std' value='0'><span>GB42590<br>旧国标</span></label>"
+"<label><input type='radio' name='std' value='1'><span>GB46750<br>新国标</span></label>"
+"</div>"
+"<details class='tip'><summary>说明：两个国标的区别</summary><div>"
+"<b>旧国标</b> = GB 42590-2023（OpenDroneID 打包报文，兼容绝大多数现有接收端）；"
+"<b>新国标</b> = GB 46750-2025（位图数据项报文，2026-05-01 实施，含实名登记标志）。"
+"切换在「保存并应用」后生效，下方身份信息只显示当前标准实际广播的字段。"
+"</div></details>"
+"</div>"
+"</div>"
+// 两列自平衡布局：左列身份信息，右列飞行参数+飞手位置+巡游参数，
+// 消除两列视图下飞行参数卡片下方的大块空白
+"<div class='col txonly'>"
+"<div class='card txonly'><h3>身份信息</h3>"
+"<label>无人机唯一 ID (UAS ID)</label><input id='uas_id' maxlength='24'>"
+"<label>机型名称 (Self-ID)</label><input id='drone_name' maxlength='20'>"
+"<p class='note' style='margin-top:2px'>仅旧国标广播（新国标报文无此数据项），两个标准下均可填写记录。</p>"
+"<div class='oldstd'><label>机型代码 (UA Type)</label>"
+"<div class='dd' id='dd2'>"
+"<div class='dd-btn' id='dd2btn'><span class='dd-txt ph' id='dd2txt'>-- 选择机型代码 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd2list'></div></div></div>"
+"<input type='hidden' id='ua_type'></div>"
+"<label>机型预设 (伪装)</label>"
+"<div class='dd' id='dd'>"
+"<div class='dd-btn' id='ddbtn'><span class='dd-txt ph' id='ddtxt'>-- 选择型号自动填充 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='ddlist'></div></div></div>"
+"<details class='tip'><summary>说明：预设如何生成序列号</summary><div>"
+"预设按机型前缀补足 20 位序列号，并填入机型名称与机型代码。"
+"只收录 FAA UAS Declaration of Compliance 里已登记序列号的机型；Neo / Flip / Mini 2 SE / Mini 4K / Lito 等未登记型号不提供预设，避免生成无效序列号。"
+"每个前缀都可在 uasdoc.faa.gov 的 Serial Numbers 里逐条核对，未给序列号的机型（如 Alta X）不在列表中。"
+"机型代码为 RID 标准 16 类航空器类别码。序列号可手动微调，其他品牌在「其他厂商」分组。"
+"两个标准均广播该序列号。</div></details>"
+"<div class='newstd'><div class='g'>"
+"<div><label>实名登记号后8位</label><input id='realname_id' maxlength='8'></div>"
+"<div><label>新国标分类</label>"
+"<div class='dd' id='dd4'>"
+"<div class='dd-btn' id='dd4btn'><span class='dd-txt ph' id='dd4txt'>-- 选择分类 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd4list'></div></div></div>"
+"<input type='hidden' id='ua_category_gb'></div>"
+"</div>"
+// 提示放在整行之下：塞进左格会让右格下拉被顶下去，两格高低不齐
+"<p class='note' style='margin-top:6px'>仅新国标广播，空 = 不填。</p></div>"
+"<div class='oldstd'><label>操作员 ID</label><input id='operator_id' maxlength='20'></div>"
+"<div class='g'>"
+"<div><label>热点名称 (SSID)</label><input id='ssid' maxlength='31'></div>"
+"<div><label>热点密码</label><input id='ap_password' maxlength='63' autocomplete='new-password'></div>"
+"</div>"
+"<p class='note' style='margin-top:2px'>WPA2 加密，8-63 位；留空 = 开放热点（谁都能连上并升级固件）。</p>"
+"<details class='tip'><summary>说明：热点密码与设备安全</summary><div>"
+"出厂默认口令 <b>sd1471123</b>，建议改成自己的。密码只接受 8-63 位可见键盘字符（WPA2 的限制），"
+"保存后热点立即重建，<b>所有已连接的手机都会被断开</b>，需要用新密码重新连接。"
+"<br>忘记口令时：把设备插上 USB，串口日志开机会打印当前 SSID 与口令；"
+"或在网页点「恢复初始」回到默认口令（需要先能连上热点）。"
+"<br>留空保存 = 开放热点，任何能搜到信号的人都能进网页改参数、上传固件，仅在调试时用。"
+"<br>这层密码的作用是<b>阻止陌生人连入热点</b>；网页本身是 HTTP 明文，同一热点下抓包仍能看到内容，"
+"它不等于完整的访问控制。接收模式下「身份信息」整卡隐藏，改密码请先切到发射模式。"
+"</div></details>"
+"<div class='g'>"
+"<div><label id='chlbl'>Wi-Fi 信道 (1-13)</label><input id='channel' type='number' min='1' max='13'></div>"
+"<div><label>广播间隔 (ms)</label><input id='beacon_interval_ms' type='number' min='200' max='60000'></div>"
+"</div></div>"
+// 飞手位置放左列：飞行参数加了高度/航向/垂直速度后右列变长，把这项挪过来两列才齐平
+"<div class='card txonly'><h3>飞手位置</h3><div class='g'>"
+"<div><label>飞手纬度</label><input id='operator_latitude' type='number' step='0.0000001'></div>"
+"<div><label>飞手经度</label><input id='operator_longitude' type='number' step='0.0000001'></div>"
+"</div>"
+"<label>飞手海拔高度 m</label><input id='operator_altitude' type='number'>"
+"<details class='tip'><summary>说明：飞手坐标与无人机位置</summary><div>"
+"改动飞手坐标后，无人机位置会按默认相对偏移自动生成（约正北 319 m、正东 27 m）；"
+"单独修改无人机位置不会影响飞手。若已调好巡游圆心，再改飞手坐标会把圆心一并平移。</div></details></div>"
+"</div>"
+"<div class='col txonly'>"
+"<div class='card txonly'><h3>飞行参数</h3><div class='g'>"
+"<div><label>基准纬度</label><input id='base_latitude' type='number' step='0.0000001'></div>"
+"<div><label>基准经度</label><input id='base_longitude' type='number' step='0.0000001'></div>"
+"<div><label>海拔高度 m (MSL)</label><input id='base_altitude_msl' type='number'></div>"
+"<div><label>地面海拔 m</label><input id='ground_altitude' type='number' step='0.1'></div>"
+"<div><label>相对高度 m (AGL)</label><input id='altitude_agl' type='number'></div>"
+"<div><label>气压高度 m</label><input id='baro_altitude' type='number' step='0.1'></div>"
+"<div><label>水平速度 m/s</label><input id='speed_horizontal' type='number' step='0.1'></div>"
+"<div><label>运行状态</label>"
+"<div class='dd' id='dd3'>"
+"<div class='dd-btn' id='dd3btn'><span class='dd-txt ph' id='dd3txt'>-- 选择状态 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd3list'></div></div></div>"
+"<input type='hidden' id='status'></div>"
+"<div><label>航向 °</label><input id='heading' type='number' min='0' max='359' step='0.1'></div>"
+"<div><label>航向来源</label>"
+"<div class='dd' id='dd5'>"
+"<div class='dd-btn' id='dd5btn'><span class='dd-txt ph' id='dd5txt'>-- 选择来源 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd5list'></div></div></div>"
+"<input type='hidden' id='heading_mode'></div>"
+"<div><label>垂直速度 m/s</label><input id='speed_vertical' type='number' step='0.1'></div>"
+"<div><label>垂直速度来源</label>"
+"<div class='dd' id='dd6'>"
+"<div class='dd-btn' id='dd6btn'><span class='dd-txt ph' id='dd6txt'>-- 选择来源 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd6list'></div></div></div>"
+"<input type='hidden' id='vspd_mode'></div>"
+"<div class='full oldstd'><label>高度基准（相对高度参考）</label>"
+"<div class='dd' id='dd7'>"
+"<div class='dd-btn' id='dd7btn'><span class='dd-txt ph' id='dd7txt'>-- 选择高度基准 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd7list'></div></div></div>"
+"<input type='hidden' id='height_type'></div>"
+"<div class='full newstd'><label>遥控站位置类型</label>"
+"<div class='dd' id='dd8'>"
+"<div class='dd-btn' id='dd8btn'><span class='dd-txt ph' id='dd8txt'>-- 选择位置类型 --</span>"
+"<span class='dd-car'>&#9662;</span></div>"
+"<div class='dd-panel'><div class='dd-list' id='dd8list'></div></div></div>"
+"<input type='hidden' id='operator_location_type'></div>"
+"</div><details class='tip'><summary>说明：高度换算与航向/垂直速度来源</summary><div>"
+"相对高度 = 海拔 − 地面海拔，改任意两个第三个自动换算。气压高度默认跟随海拔，"
+"有真实气压计时可单独声明。两者都会随「高度波动幅度」在基准值上下摆动（幅度填 0 则完全恒定）。"
+"航向与垂直速度选「自动」时由巡游推算，选「固定」则原样广播、巡游不再改写；"
+"直接在数值框里输入会自动切到「固定」。</div></details></div>"
+"<div class='card txonly'><h3>巡游参数</h3><div class='g'>"
+"<div><label>巡游速度系数</label><input id='patrol_speed' type='number' step='0.01'></div>"
+"<div><label>高度波动幅度 m</label><input id='altitude_wave' type='number' step='0.5'></div>"
+"<div><label>纬度半径 (度)</label><input id='patrol_radius_lat' type='number' step='0.00001'></div>"
+"<div><label>经度半径 (度)</label><input id='patrol_radius_lon' type='number' step='0.00001'></div>"
+"</div><details class='tip'><summary>说明：轨迹速度与报文速度</summary>"
+"<div><p id='patrolCalc' style='margin:0'></p></div></details></div>"
+"</div>"
+"<div class='card span2 txonly'><h3>地图选点</h3>"
+"<div class='seg'>"
+"<label><input type='radio' name='pt' value='op' checked><span>选点：飞手</span></label>"
+"<label><input type='radio' name='pt' value='drone'><span>选点：无人机</span></label>"
+"</div>"
+"<div id='map'></div>"
+"<div id='gridbox' style='display:none'>"
+"<canvas id='grid' width='320' height='320'></canvas>"
+"<div class='mpp'><label>比例尺 (米/像素)</label><select id='mpp'>"
+"<option value='5'>5</option><option value='20' selected>20</option>"
+"<option value='100'>100</option><option value='500'>500</option></select></div>"
+"</div>"
+"<div id='liveinfo'></div>"
+"<details class='tip'><summary>说明：地图图例与离线网格</summary><div>"
+"红点=飞手，绿点=无人机，蓝点=实时广播位置，蓝线=飞行轨迹（最近约 8 分钟），绿圈=巡游范围。"
+"<br>地图以飞手位置为中心：选点对象为「飞手」时点击/拖动会同步按默认偏移生成无人机位置；"
+"选「无人机」时只改无人机位置。在线地图需手机保持移动数据，无网络时自动切换离线网格。"
+"<br>连着本机热点时手机没有外网，瓦片可能拉不下来：用 <b>https://192.168.4.1</b> 打开本页"
+"（首次会提示证书不安全，点「继续访问」），再点上面的「连接蓝牙」——之后所有数据走蓝牙，"
+"<b>可以把 Wi-Fi 关掉</b>用流量看地图。改配置和升级固件仍要连回热点。"
+"</div></details>"
+"</div>"
+"<div class='card span2' id='rxbox' style='display:none'><h3>接收监测</h3>"
+"<div class='rxbar'>"
+"<div class='chip'><b id='s_online'>0</b><span>在线目标</span></div>"
+"<div class='chip on'><b id='s_rid'>0</b><span>RID 帧</span></div>"
+"<div class='chip'><b id='s_total'>0</b><span>总帧数</span></div>"
+"<div class='chip'><b id='s_ok'>0</b><span>解析成功</span></div>"
+"<div class='chip warn' id='s_ovfbox'><b id='s_ovf'>0</b><span>队列溢出</span></div>"
+"<button class='fbtn' id='foldall' type='button'>全部展开 ▾</button>"
+"</div>"
+"<div class='rxbanner'><span class='dot live'></span>"
+"<span id='rxstate'>正在监听…</span></div>"
+// 蓝牙取数：连上后网页的所有 /api 查询改走 BLE，Wi-Fi 可以断开去用流量看地图
+"<div class='blebar' id='blebar'>"
+"<span id='bletxt'>蓝牙取数未连接</span>"
+"<a class='bfbtn blenk' id='blelnk' href='#' onclick='bleGo();return false' style='display:none'>改用 https 打开</a>"
+"<button class='bfbtn' id='blebtn' type='button' onclick='bleGo()'>连接蓝牙</button>"
+"<button class='bfbtn' id='bleoff' type='button' onclick='bleStop()' style='display:none'>断开</button>"
+"</div>"
+// 接收端信号地图容器：默认隐藏，进入接收模式且 /rxmap.js 加载成功后才显示。
+// 容器 id 与发射端地图（map）完全不同，两张地图各自独立实例、互不干扰。
+"<div class='mapbox' id='rxmapbox' style='display:none'><div id='rxmap'></div>"
+"<canvas id='rxgrid' width='320' height='320'></canvas>"
+"<div class='mapleg'>"
+"<span><i style='background:#5b21b6'></i>GB46750</span>"
+"<span><i style='background:#0369a1'></i>GB42590</span>"
+"<span><i style='background:#6b7280'></i>ASTM</span>"
+"<span><i style='background:#e67e22;border-radius:3px;transform:rotate(45deg)'></i>飞手位置</span>"
+"<span><i style='background:#1565c0;height:2px;border-radius:1px'></i>飞行轨迹</span>"
+"</div>"
+"<button class='mapbtn' id='rxfit' type='button'>全览</button>"
+"</div>"
+"<div class='rxoff' id='rxgridnote'></div>"
+"<div class='rxlist' id='rxlist'></div>"
+"<details class='tip'><summary>说明：接收列表与离线规则</summary><div>"
+"监听信道跟随上方「Wi-Fi 信道」设置（保存后生效），只能收到与本机同信道的广播。"
+"卡片按信号强度排序，<b>绿色标题</b>为机型/描述，标题行右侧为链路与统计"
+"（MAC · 信号强度 · 累计帧数 · 最后收到），<b>格内小字</b>为字段名；"
+"飞手位置与实名登记号同一行；点击卡片在地图上定位。"
+"操作员 ID、机型分类、精度、时间戳等<b>全部字段</b>都收在「报文详情」里，点标题展开。"
+"10 秒无信号标记为已离线（灰度显示，保留 30 分钟），列表 2 秒刷新。"
+"<br>卡片内「导航到无人机 / 导航到飞手」按钮点击后弹出高德 / 百度二选一，"
+"选定后<b>直接唤起已安装的地图 App</b>并进入驾车路线（高德 amapuri / 百度 bdapp 原生协议），"
+"目的地取机型名与经纬度（WGS-84 原始值，由 App 自行转 GCJ-02）；"
+"只有 App 未安装（1.5 秒内没跳走）才退回网页版。</div></details>"
+"</div>"
+// 历史轨迹：接收模式落盘才有内容，因此只在接收模式显示，发射模式整卡隐藏
+"<div class='card span2 rxonly' id='logbox' style='display:none'>"
+"<h3 class='lghd open' id='lghd' onclick='logFold()'>历史轨迹"
+"<button class='lgsw' id='lgsw' type='button' onclick='logToggle();event.stopPropagation()'>记录：关</button>"
+"<i class='tog' id='lgtog'>收起</i></h3>"
+"<div id='lgbody'>"
+"<div class='otainfo'>"
+"<span>记录 <b id='lgcnt'>--</b> 条</span>"
+"<span>占用 <b id='lgused'>--</b></span>"
+"<span>时间范围 <b id='lgrange'>--</b></span>"
+"</div>"
+"<div class='lgbar'><i id='lgfill'></i></div>"
+"<div class='rxlist' id='lgtargets'></div>"
+"<div class='actions'>"
+"<button class='fbtn' id='lgexport' type='button' onclick='logExport()'>导出 CSV</button>"
+"<button class='fbtn' id='lgclear' type='button' onclick='logClear()'>清空记录</button>"
+"</div>"
+// 轨迹详情：点目标行的「看轨迹」打开，标题行右侧可收起；地图 + 回放 + 分页
+"<div class='lgdet' id='lgdet' style='display:none'>"
+"<div class='lgdhd'><span class='who' id='lgwho'>--</span>"
+"<button type='button' onclick='logClose()'>收起轨迹</button></div>"
+"<div class='lgmap' id='lgmap'></div>"
+"<canvas class='lgmap' id='lgcv' style='display:none'></canvas>"
+"<div class='lgctl'>"
+"<button type='button' id='lgpp' onclick='lgPlayToggle()'>播放</button>"
+"<button type='button' id='lgrs' onclick='lgReset()'>重置</button>"
+"<span class='spd'>速度"
+"<select id='lgrate' onchange='lgSetRate(this.value)'>"
+"<option value='1'>1x</option><option value='2'>2x</option>"
+"<option value='4'>4x</option></select></span>"
+"<span class='now' id='lgnow'></span>"
+"</div>"
+"<div class='lgpage' id='lgpage'></div>"
+"<div class='rxlist' id='lgpoints'></div>"
+"</div>"
+"</div>"
+"<details class='tip'><summary>说明：记录了什么、能存多久、时间为什么不对</summary><div>"
+"<b>记录默认关闭</b>：设备没有 RTC，上电时时间是空的，先写下的条目只能记「上电计时」。"
+"所以固件上电<b>不会自动开始记录</b>，请在<b>授时成功</b>（页面顶部「运行模式」里那条状态变绿）之后再点开开关。"
+"开关<i>每拨一次就存进设备</i>，断电重启会沿用你上次的选择；想回到默认就在页面上关掉它。"
+"<br>授时<b>不会</b>替你打开记录，开关始终由你决定，看到「记录：开」才是真的在记。"
+"<br>只有<b>接收模式</b>才写入。每个目标<b>最快 5 秒一条</b>，位置变化超过 30 米时补记一条，"
+"所以高速飞行时点更密、悬停时最省。每条 64 字节，分区 4 MB 约 6.5 万条："
+"单目标约 90 小时，五个目标同时约 18 小时；写满后自动覆盖最旧的记录，不需要手动清理。"
+"<br>一条记录就是一次位置快照：时间、MAC、UAS ID 前 14 位、经纬度、大地高度、相对高度、"
+"水平/垂直速度、航向、机型、运行状态、协议、信号强度。<b>不保存原始报文</b>。"
+"<br>网页<b>每页 30 条、最多翻 10 页</b>（共最近 300 条）：再往前的记录不占设备内存去翻页，"
+"点「导出 CSV」把该目标<b>全部</b>记录下载下来用电脑看。"
+"<br>点目标行的「<b>看轨迹</b>」打开航线回放：打开后网页会把<b>这 10 页依次取回、合并成一条完整航线</b>"
+"（最多 300 条，合并时底部会显示进度），地图上画出整条连线、起点（绿）、终点（红）与当前点（白圈）；"
+"「播放」按时间顺序走完全部记录，回放到哪一页上方的表格就自动翻到哪一页并高亮该行，速度可选 1x/2x/4x。"
+"地图瓦片需要手机联网，没有网络时自动换成内置的比例网格（仍有轨迹形状与比例尺）。"
+"<br>设备没有 RTC，<b>时间以手机为准</b>：打开本页时会把手机时间同步给设备，"
+"同步之前写入的条目只有上电计时，显示为「上电 hh:mm:ss」；断电后上电计时会归零，"
+"但已经存下的时间戳不会变。"
+"<br>「清空记录」只是把日志代次加一，毫秒级完成，不会擦整个分区，之后新记录会自然覆盖旧数据。"
+"<br>只想删掉其中<b>一台</b>无人机，点它那一行的「<b>删除</b>」：设备给这个目标记一个"
+"「到此为止」的标记（同样毫秒级，不擦 flash），它从此不再出现在列表里、也翻不到轨迹，"
+"其他目标完全不受影响；这台无人机要是再飞回来，之后的新记录照常显示。"
+"这个标记存在 NVS 里，<b>重启后依然有效</b>，不会从 flash 里被重新扫出来。"
+"</div></details>"
+"</div>"
+"<div class='actions span2'>"
+"<button onclick='save()'>保存并应用</button>"
+"<button class='danger' onclick='resetCfg()'>恢复初始</button>"
+"</div>"
+"<div id='msg' class='span2'></div>"
+"</div>"
+// 地图选择弹层：点卡片里的「导航到无人机 / 飞手」才出现，选完立即关闭
+"<div class='navmask' id='navpick'>"
+"<div class='navsheet'>"
+"<h4 id='navpick_t'>导航到目标</h4>"
+"<p class='sub' id='navpick_p'></p>"
+"<button class='navopt' type='button' data-prov='amap'><b>高德地图 App</b>"
+"<span>直接打开高德并进入驾车路线；未安装则退回高德网页版</span></button>"
+"<button class='navopt' type='button' data-prov='bd'><b>百度地图 App</b>"
+"<span>直接打开百度地图并进入驾车路线；未安装则退回百度网页版</span></button>"
+"<button class='navcancel' type='button' id='navpick_c'>取消</button>"
+"</div></div>"
+// 固件升级弹层：入口在顶部右上角，两个模式都在（升级的是设备本身，与收/发无关）
+"<div class='navmask' id='otamask' onclick='otaClose()'>"
+"<div class='navsheet' onclick='event.stopPropagation()'>"
+"<h4>固件升级 (OTA)</h4>"
+"<div class='otainfo'>"
+"<span>当前版本 <b id='otaver'>--</b></span>"
+"<span>运行分区 <b id='otapart'>--</b></span>"
+"<span>可升级容量 <b id='otacan'>--</b></span>"
+"</div>"
+"<label>固件文件（.bin，选编译产物 remoteid_scanner.bin）</label>"
+"<div class='otafile'>"
+"<input type='file' id='otafile' accept='.bin'>"
+"<button type='button' id='otabtn' onclick='otaStart()'>上传并升级</button>"
+"</div>"
+"<div class='otabar' id='otabar'><i id='otafill'></i></div>"
+"<div class='otatxt' id='otatxt'></div>"
+"<details class='tip'><summary>说明：升级流程、断电保护与风险</summary><div>"
+"上传的是编译产物<b>单个 .bin</b>（约 0.6–0.8 MB），不是厂商升级包、也不是压缩包。"
+"固件写入<b>另一个</b> app 分区，写完校验镜像头、芯片型号与 SHA256 通过后才切换启动项；"
+"传输中断或中途断电只会留下一个写坏的备份分区，<b>重启仍是旧固件</b>。"
+"新固件若在完成初始化前崩溃，引导器会自动退回上一版（已在固件里开启回滚）。"
+"<br>升级成功后设备自动重启，热点会断开约 10 秒，本页会自动刷新并显示新版本号。"
+"<br>分区表已改为 factory + ota_0 + ota_1（各 2 MB）：<b>首次</b>需要用 USB 完整烧录一次，"
+"之后才能完全依赖网页升级。位置与参数存在 NVS，升级不会清除。"
+"<br>热点默认开启 WPA2 口令（可在「身份信息」里改），能连上热点的人才能升级固件；"
+"上传令牌只能挡住其它网页的跨站误提交，不是权限控制。"
+"</div></details>"
+"<button class='navcancel' type='button' onclick='otaClose()'>关闭</button>"
+"</div></div>"
+"<p class='foot'>手机连接本机热点后用 https://192.168.4.1 打开此页（首次会提示证书不安全，点继续访问即可）。"
+"修改 SSID / 信道 / 广播间隔保存后需重新连接热点。配置已持久化，断电不丢失。</p>"
+"</div>"
+"<script>"
+// 地图变量前置声明：save()/drawCircle() 等函数引用这些变量，
+// 若声明留在脚本后段，一旦前段任何顶层语句抛错，变量将停留在
+// 暂时性死区（部分 WebView 会报 circle 未定义），提前声明杜绝此类问题
+"let map=null,opMarker=null,dMarker=null,live=null,circle=null,ginit=false;"
+"let trailPts=[],trailLine=null;"   // 飞行轨迹：poll 每 2 秒记录广播位置连成线
+"const F=['uas_id','drone_name','operator_id','realname_id','ssid','ap_password','channel','beacon_interval_ms','ua_type',"
+"'base_latitude','base_longitude','base_altitude_msl','ground_altitude','altitude_agl','baro_altitude',"
+"'speed_horizontal','heading','heading_mode','speed_vertical','vspd_mode',"
+"'operator_latitude','operator_longitude','operator_altitude',"
+"'status','height_type','operator_location_type',"
+"'patrol_speed','altitude_wave','patrol_radius_lat','patrol_radius_lon','ua_category_gb'];"
+"function msg(t,ok){const m=document.getElementById('msg');m.textContent=t;"
+"m.style.color=ok?'#0a7d43':'#c0392b';}"
+"function fld(k){return document.getElementById(k);}"
+"function baseLL(){const la=parseFloat(fld('base_latitude').value)||0;"
+"const lo=parseFloat(fld('base_longitude').value)||0;return [la,lo];}"
+"function opLL(){const la=parseFloat(fld('operator_latitude').value)||0;"
+"const lo=parseFloat(fld('operator_longitude').value)||0;return [la,lo];}"
+// 无人机基准点相对飞手的默认偏移（度），取自 crid_config.c 出厂默认值之差
+"const D_OFF=[0.00287,0.00026];"
+"function pickLL(la,lo){fld('base_latitude').value=la.toFixed(7);"
+"fld('base_longitude').value=lo.toFixed(7);}"
+"function autoDrone(la,lo){pickLL(la+D_OFF[0],lo+D_OFF[1]);}"
+"function ptarget(){const r=document.querySelector('input[name=pt]:checked');"
+"return r?r.value:'op';}"
+"function syncMarkers(){const d=baseLL(),o=opLL();"
+"if(opMarker)opMarker.setLatLng(o);"
+"if(dMarker)dMarker.setLatLng(d);"
+"if(map&&opMarker)map.panTo(o);"
+// 地图函数在部分手机浏览器恢复休眠标签页后可能丢失（V8 上下文部分丢弃），
+// 调用点全部加 typeof 防护：地图失效只降级，绝不阻塞参数编辑
+"if(typeof drawCircle==='function')drawCircle();"
+"if(!map){gbase=o;gpick=null;if(typeof drawGrid==='function')drawGrid();}}"
+"function applyPick(t,la,lo){"
+"if(t==='op'){fld('operator_latitude').value=la.toFixed(7);"
+"fld('operator_longitude').value=lo.toFixed(7);autoDrone(la,lo);}"
+"else{pickLL(la,lo);}"
+"syncMarkers();}"
+// 手动编辑飞手坐标输入框时，实时自动生成无人机位置
+"function bindAuto(id){fld(id).addEventListener('input',function(){"
+"const la=parseFloat(fld('operator_latitude').value);"
+"const lo=parseFloat(fld('operator_longitude').value);"
+"if(!isNaN(la)&&!isNaN(lo)){autoDrone(la,lo);syncMarkers();}});}"
+"bindAuto('operator_latitude');bindAuto('operator_longitude');"
+// 巡游实况换算：半径(度) + 系数(弧度/10秒) -> 轨迹真实线速度，用于和「水平速度」对照
+"function patrolCalc(){"
+"const R=111320,la=parseFloat(fld('base_latitude').value)||0;"
+"const rl=parseFloat(fld('patrol_radius_lat').value)||0;"
+"const ro=parseFloat(fld('patrol_radius_lon').value)||0;"
+"const om=(parseFloat(fld('patrol_speed').value)||0)/10;"
+"const vy=rl*R*om,vx=ro*R*Math.cos(la*Math.PI/180)*om;"
+"const v=Math.sqrt(vx*vx+vy*vy);"
+"const rep=parseFloat(fld('speed_horizontal').value);"
+"const wv=parseFloat(fld('altitude_wave').value);"
+"const hm=String(fld('heading_mode')?fld('heading_mode').value:'0');"
+"const vm=String(fld('vspd_mode')?fld('vspd_mode').value:'0');"
+"const hd=parseFloat(fld('heading')?fld('heading').value:'');"
+"const vv=parseFloat(fld('speed_vertical')?fld('speed_vertical').value:'');"
+"const el=fld('patrolCalc');if(!el)return;"
+"let s='轨迹真实线速度约 '+v.toFixed(2)+' m/s；报文上报的「水平速度」为 '"
+"+(isNaN(rep)?'--':rep.toFixed(1))+' m/s（由飞行参数里的输入决定，巡游不会改写它）';"
+"s+='。两者差距过大时，接收端用坐标序列反算的速度会与报文对不上，容易被判为伪造';"
+"if(vm==='1'){s+='。垂直速度固定为 '+(isNaN(vv)?'--':vv.toFixed(1))+' m/s，不随高度波动变化';}"
+"else if(!isNaN(wv)){"
+"if(wv>0)s+='。高度在基准值上下 ±'+wv.toFixed(1)+' m 摆动，约 10.5 分钟一轮，峰值垂直速度 '+"
+"(wv*0.01).toFixed(2)+' m/s；填 0 可固定高度';"
+"else s+='。高度波动幅度为 0：高度固定，垂直速度恒为 0';}"
+"if(hm==='1')s+='。航向固定为 '+(isNaN(hd)?'--':hd.toFixed(1))+'°，不随轨迹切线变化';"
+"else s+='。航向由轨迹切线自动推算';"
+"el.textContent=s;}"
+"['patrol_speed','patrol_radius_lat','patrol_radius_lon','base_latitude','speed_horizontal',"
+"'altitude_wave','heading','heading_mode','speed_vertical','vspd_mode']"
+".forEach(function(id){const e=fld(id);if(e)e.addEventListener('input',patrolCalc);});"
+// 手动在数值框里输入航向/垂直速度 = 用户就是要这个值：自动把来源下拉切到「固定」，
+// 否则巡游会在下一个 10 秒步进把它改回自动推算值（与旧版水平速度被覆盖同一类坑）。
+// 只是 .value 赋值不会触发 input 事件，所以加载配置时不会被误切。
+"function bindFixVal(id,modeId){const e=fld(id),m=fld(modeId);"
+"if(!e||!m)return;e.addEventListener('input',function(){"
+"if(m.value!=='1'){m.value='1';ddSync(modeId);}"
+"if(typeof patrolCalc==='function')patrolCalc();});}"
+"bindFixVal('heading','heading_mode');bindFixVal('speed_vertical','vspd_mode');"
+// 高度四联动：相对高度 = 海拔 − 地面海拔。改海拔或地面海拔则重算相对高度，
+// 改相对高度则反推海拔，保证三者永远自洽（固件保存时也会按同一公式重算一次）。
+// 气压高度默认「跟随海拔」：只有它当前仍等于改动前的海拔值时才同步，
+// 用户单独声明过气压高度（例如气压计基准与起飞点不同）就不再动它。
+"let lastMsl=NaN;"
+"function altSync(src){"
+"const m=fld('base_altitude_msl'),g=fld('ground_altitude'),a=fld('altitude_agl');"
+"const b=fld('baro_altitude');"
+"const M=parseFloat(m.value),G=parseFloat(g.value),A=parseFloat(a.value);"
+"const B=b?parseFloat(b.value):NaN;"
+"if(src==='altitude_agl'){if(!isNaN(A)&&!isNaN(G))m.value=(A+G).toFixed(1);}"
+"else{if(!isNaN(M)&&!isNaN(G))a.value=(M-G).toFixed(1);}"
+"if(b&&src!=='load'){const nM=parseFloat(m.value);"
+"if(!isNaN(nM)&&!isNaN(B)&&!isNaN(lastMsl)&&Math.abs(B-lastMsl)<0.05)b.value=nM.toFixed(1);"
+"if(isNaN(B)||isNaN(lastMsl))b.value=nM.toFixed(1);}"
+"lastMsl=parseFloat(m.value);"
+"if(typeof patrolCalc==='function')patrolCalc();}"
+"['base_altitude_msl','ground_altitude','altitude_agl'].forEach(function(id){"
+"fld(id).addEventListener('input',function(){altSync(id);});});"
+// ---- 机型预设：序列号前缀 -> 型号。前缀由 FAA UAS DoC 官方登记的序列号推导
+//      （快照 data/faa_serial_2026-11-17.tsv，生成脚本 tools/models_faa.py；未登记序列号的一律不猜）。----
+"const MDL=[['消费级',[['1581F0M6','Mavic 2 Zoom'],['1581F11V','Phantom 4 Pro V2.0'],"
+"['1581F163','Mavic 2 Pro'],['1581F1WN','Mavic Air 2'],['1581F3N3','Mavic Air 2'],"
+"['1581F3YT','Air 2S'],['1581F45T','Mavic 3'],['1581F4QZ','Mavic 3 Cine'],['1581F5YH','Mini 3'],"
+"['1581F67P','Mavic 3 Classic'],['1581F67Q','Mavic 3 Pro'],['1581F6L5','Mini 3 Pro'],"
+"['1581F6MK','Mavic 3 Pro Cine'],['1581F6N8','Air 3'],['1581F6Z9','Mini 4 Pro'],"
+"['1581F895','Air 3S'],['1581F8LQ','Mavic 4 Pro (64GB)'],['1581F986','Mavic 4 Pro (512GB)'],"
+"['1581F9DE','Mini 5 Pro']]],['穿越机',[['1581F37Q','FPV'],['1581F4QW','Avata'],['1581F6W8','Avata 2'],"
+"['1581FA8J','Avata 360'],['1581FBLK','Avata 360']]],['行业级',[['1581F0UY','Phantom 4 RTK'],"
+"['1581F1ZN','Matrice 300 RTK'],['1581F4BN','Matrice 30'],"
+"['1581F4GC','Mavic 2 Enterprise Advanced'],['1581F4Z4','Inspire 3'],['1581F5BK','Matrice 30T'],"
+"['1581F5BL','Matrice 30 (机场版)'],['1581F5BM','Matrice 30T (机场版)'],['1581F5FH','Mavic 3E'],"
+"['1581F5FJ','Mavic 3T'],['1581F5FK','Mavic 3M'],['1581F62H','Matrice 30T'],"
+"['1581F6GK','Matrice 350 RTK'],['1581F6Q8','Matrice 3TD'],['1581F6QA','Matrice 3D'],"
+"['1581F7FV','Matrice 4E'],['1581F7K3','Matrice 4T'],['1581F8DB','Matrice 400'],"
+"['1581F8HG','Matrice 4TD'],['1581F8HH','Matrice 4D'],['1581FBEX','Matrice 3TA']]],['植保',["
+"['1581F446','Agras T10'],['1581F446','Agras T30'],['1581F574','Agras T20P'],"
+"['1581F574','Agras T40'],['1581F6BU','Agras T50'],['1581F836','Agras T25P'],"
+"['1581F8ZL','Agras T100'],['1581F8ZX','Agras T70P']]],['物流',[['1581F7C6','FlyCart 30'],"
+"['1581FAN4','FlyCart 100']]],['其他厂商',[['1748FEV4AL','Autel Alpha'],"
+"['1748FDF2JD2924','Dragonfish Lite'],['1748FDF3JD3','Dragonfish Pro'],"
+"['1748FDF1JD1','Dragonfish Standard'],['1748CHL7','EVO II'],['1748FEV2H','EVO II V3'],"
+"['1748CLTC','EVO Lite'],['1748CLT09214','EVO Lite'],['1748CLTG9214910','EVO Lite'],"
+"['1748CLTC','EVO Lite+'],['1748CNA','EVO Nano'],['1748FEC4NAC825','EVO Nano+'],"
+"['1748FEV3HM','EVO Max'],['1748FEV3HMP','MDX-1'],['1588E040452','Anafi AI'],"
+"['1588E040505','Anafi USA'],['1588E040465','Anafi UKR GOV'],['1668F00','Skydio 2'],"
+"['1668BS20','Skydio 2+'],['1668BE10JA00','Skydio X2E'],['1668BR40EA00','Skydio X10E'],"
+"['1668BR70CA00UZ','Skydio R10'],['1863FPEG8218','XAG P100'],['1863FPEG8219','XAG P100 Pro'],"
+"['1863FPEG8223','XAG P150'],['1863F251','XAG P150 Max'],['1863F242','XAG P60'],"
+"['1644FMD4100000007','md4-1000'],['1644FMD4300000001','md4-3000'],['1644FMD4E1VA0000','EasyOne'],"
+"['1587A051','eBee X'],['1587A540','eBee TAC'],['1701DSPR','Percepto AirMax'],"
+"['1701DGAS','Percepto AirMax OGI'],['17444242','WingtraOne Gen II']]]];"
+"(function(){const dd=fld('dd'),bt=fld('ddbtn'),tx=fld('ddtxt'),ls=fld('ddlist');"
+"function pick(nm){const ps=[];"
+"MDL.forEach(function(g){g[1].forEach(function(m){if(m[1]===nm)ps.push(m[0]);});});"
+"const p=ps[Math.floor(Math.random()*ps.length)];"
+"const cs='ABCDEFGHJKLMNPQRSTUVWXYZ0123456789';let sf='';"
+"const need=Math.max(20-p.length,0);"
+"for(let i=0;i<need;i++){sf+=cs[Math.floor(Math.random()*cs.length)];}"
+"fld('uas_id').value=(p+sf).substring(0,20);"
+"fld('drone_name').value=nm;"
+"fld('ua_type').value='2';uatSync();"
+"tx.textContent=nm;tx.classList.remove('ph');"
+"msg('已按 '+nm+' 生成预设（前缀 '+p+'）：序列号/机型名称/机型代码已填充，可手动微调后保存',true);}"
+"MDL.forEach(function(g){const hd=document.createElement('div');"
+"hd.className='dd-group';hd.textContent=g[0];ls.appendChild(hd);"
+"const seen={};g[1].forEach(function(m){if(seen[m[1]])return;seen[m[1]]=1;"
+"const it=document.createElement('div');it.className='dd-item';it.textContent=m[1];"
+"it.onclick=function(){pick(m[1]);dd.classList.remove('open');};"
+"ls.appendChild(it);});});"
+"bt.onclick=function(e){e.stopPropagation();dd.classList.toggle('open');};"
+"ls.onclick=function(e){e.stopPropagation();};"
+"document.addEventListener('click',function(){dd.classList.remove('open');});})();"
+// ---- 运行状态下拉 ----
+"const ST=[['0','未声明'],['1','地面'],['2','空中'],['3','紧急'],['4','识别故障']];"
+"function statusSync(){const v=String(fld('status').value);let lb='';"
+"ST.forEach(function(u){if(u[0]===v)lb=u[1];});"
+"const t=fld('dd3txt');"
+"if(lb){t.textContent=lb;t.classList.remove('ph');}"
+"else{t.textContent='-- 选择状态 --';t.classList.add('ph');}}"
+"(function(){const dd=fld('dd3'),bt=fld('dd3btn'),ls=fld('dd3list');"
+"ST.forEach(function(u){const it=document.createElement('div');it.className='dd-item';"
+"it.textContent=u[1];"
+"it.onclick=function(){fld('status').value=u[0];statusSync();dd.classList.remove('open');};"
+"ls.appendChild(it);});"
+"bt.onclick=function(e){e.stopPropagation();dd.classList.toggle('open');};"
+"ls.onclick=function(e){e.stopPropagation();};"
+"document.addEventListener('click',function(){dd.classList.remove('open');});})();"
+"const UAT=[['0','未声明 (None)'],['1','固定翼 (Aeroplane)'],['2','多旋翼/直升机 (Multirotor)'],"
+"['3','旋翼机 (Gyroplane)'],['4','垂直起降固定翼 (VTOL)'],['5','扑翼机 (Ornithopter)'],"
+"['6','滑翔机 (Glider)'],['7','风筝 (Kite)'],['8','自由气球 (Free Balloon)'],"
+"['9','系留气球 (Captive Balloon)'],['10','飞艇 (Airship)'],['11','降落伞 (Free Fall/Parachute)'],"
+"['12','火箭 (Rocket)'],['13','系留动力飞行器 (Tethered)'],['14','地面障碍物 (Ground Obstacle)'],"
+"['15','其他 (Other)']];"
+"function uatSync(){const v=String(fld('ua_type').value);let lb='';"
+"UAT.forEach(function(u){if(u[0]===v)lb=u[1];});"
+"const t=fld('dd2txt');"
+"if(lb){t.textContent=v+' - '+lb;t.classList.remove('ph');}"
+"else{t.textContent='-- 选择机型代码 --';t.classList.add('ph');}}"
+"(function(){const dd=fld('dd2'),bt=fld('dd2btn'),ls=fld('dd2list');"
+"UAT.forEach(function(u){const it=document.createElement('div');it.className='dd-item';"
+"it.textContent=u[0]+' - '+u[1];"
+"it.onclick=function(){fld('ua_type').value=u[0];uatSync();dd.classList.remove('open');};"
+"ls.appendChild(it);});"
+"bt.onclick=function(e){e.stopPropagation();dd.classList.toggle('open');};"
+"ls.onclick=function(e){e.stopPropagation();};"
+"document.addEventListener('click',function(){dd.classList.remove('open');});})();"
+// ---- 新国标分类下拉（GB46750 数据项 004，0=微型 ~ 4=大型）----
+"const GBC=[['0','微型'],['1','轻型'],['2','小型'],['3','中型'],['4','大型']];"
+"function gbcSync(){const v=String(fld('ua_category_gb').value);let lb='';"
+"GBC.forEach(function(u){if(u[0]===v)lb=u[1];});"
+"const t=fld('dd4txt');"
+"if(lb){t.textContent=v+' - '+lb;t.classList.remove('ph');}"
+"else{t.textContent='-- 选择分类 --';t.classList.add('ph');}}"
+"(function(){const dd=fld('dd4'),bt=fld('dd4btn'),ls=fld('dd4list');"
+"GBC.forEach(function(u){const it=document.createElement('div');it.className='dd-item';"
+"it.textContent=u[0]+' - '+u[1];"
+"it.onclick=function(){fld('ua_category_gb').value=u[0];gbcSync();dd.classList.remove('open');};"
+"ls.appendChild(it);});"
+"bt.onclick=function(e){e.stopPropagation();dd.classList.toggle('open');};"
+"ls.onclick=function(e){e.stopPropagation();};"
+"document.addEventListener('click',function(){dd.classList.remove('open');});})();"
+// ---- 通用下拉：新增的来源/基准选择沿用「机型代码 / 运行状态」那套点击展开面板 ----
+// 与原生 select 的区别：样式统一（灰底圆角 + 箭头旋转 + 悬浮高亮），选中后面板自动收起
+"var DDS={};"
+"function ddMake(n,hid,items,ph){var dd=fld('dd'+n),bt=fld('dd'+n+'btn'),"
+"ls=fld('dd'+n+'list'),tx=fld('dd'+n+'txt');"
+"if(!dd||!bt||!ls||!tx)return;"
+"function sync(){var v=String(fld(hid).value),lb='';"
+"items.forEach(function(u){if(u[0]===v)lb=u[1];});"
+"if(lb){tx.textContent=lb;tx.classList.remove('ph');}"
+"else{tx.textContent=ph;tx.classList.add('ph');}}"
+"items.forEach(function(u){var it=document.createElement('div');it.className='dd-item';"
+"it.textContent=u[1];"
+"it.onclick=function(){fld(hid).value=u[0];sync();dd.classList.remove('open');"
+"if(typeof patrolCalc==='function')patrolCalc();};"
+"ls.appendChild(it);});"
+"bt.onclick=function(e){e.stopPropagation();dd.classList.toggle('open');};"
+"ls.onclick=function(e){e.stopPropagation();};"
+"document.addEventListener('click',function(){dd.classList.remove('open');});"
+"DDS[hid]=sync;sync();}"
+"function ddSync(id){if(DDS[id])DDS[id]();}"
+"ddMake('5','heading_mode',[['0','自动（跟随巡游）'],['1','固定（用左侧值）']],'-- 选择来源 --');"
+"ddMake('6','vspd_mode',[['0','自动（跟高度波动）'],['1','固定（用左侧值）']],'-- 选择来源 --');"
+"ddMake('7','height_type',[['0','起飞点高度'],['1','地面高度']],'-- 选择高度基准 --');"
+"ddMake('8','operator_location_type',[['0','起飞点'],['1','实时 GNSS'],['2','固定位置']],"
+"'-- 选择位置类型 --');"
+"async function load(){try{const r=await fetch('/api/config');const j=await r.json();"
+"F.forEach(k=>{if(j[k]!==undefined&&j[k]!==null)fld(k).value=j[k];});"
+"LASTCFG=j;"
+"document.querySelectorAll('input[name=band]').forEach(function(r){r.checked=(+r.value===(+j.band||0));});"
+// S3 这类 2.4G-only 芯片没有第二个频段，「频段二选一」整块和说明里的
+// 2.4G/5.8G 那句都没有意义，直接收起来（DOM 保留，save() 照旧带 band=0）
+"if(!j.has5g){var bb=document.getElementById('bandbox');if(bb)bb.style.display='none';"
+"var bl=document.getElementById('bandln');if(bl)bl.style.display='none';}"
+"setRole((+j.band===1)?!!j.tx_5g:!!j.tx_2g);"
+"document.querySelectorAll('input[name=std]').forEach(function(r){r.checked=(+r.value===j.rid_standard);});"
+"uatSync();statusSync();gbcSync();bandUI();modeUI();stdUI();"
+"ddSync('heading_mode');ddSync('vspd_mode');ddSync('height_type');ddSync('operator_location_type');"
+"if(typeof altSync==='function')altSync('load');"
+"if(typeof patrolCalc==='function')patrolCalc();"
+"if(roleTx()&&typeof initMap==='function')initMap();}"
+"catch(e){msg('加载失败: '+e,false);}}"
+"const NUM=['channel','beacon_interval_ms','ua_type','base_latitude','base_longitude',"
+"'base_altitude_msl','ground_altitude','baro_altitude','operator_latitude','operator_longitude',"
+"'operator_altitude','altitude_agl','speed_horizontal','speed_vertical','heading','heading_mode',"
+"'vspd_mode','height_type','operator_location_type','status',"
+"'patrol_speed','altitude_wave','patrol_radius_lat','patrol_radius_lon','ua_category_gb'];"
+"async function save(){const d={};F.forEach(function(k){"
+"const v=fld(k).value;"
+"d[k]=NUM.indexOf(k)>=0?(v===''?null:parseFloat(v)):v;});"
+"const _b=+getRadio('band'),_L=LASTCFG||{};"
+"const _tx=roleTx()?1:0,_rx=_tx?0:1;"
+"d.band=_b;d.rid_standard=+getRadio('std');"
+"d.tx_2g=_b===0?_tx:(_L.tx_2g!==undefined?_L.tx_2g:1);"
+"d.rx_2g=_b===0?_rx:(_L.rx_2g!==undefined?_L.rx_2g:0);"
+"d.tx_5g=_b===1?_tx:(_L.tx_5g!==undefined?_L.tx_5g:1);"
+"d.rx_5g=_b===1?_rx:(_L.rx_5g!==undefined?_L.rx_5g:0);"
+// 信道输入框在 5.8G 下承载的就是 5.8G 信道：先把它存进 channel_5g，
+// 再把 d.channel 还原成 2.4G 的旧值，避免切频段互相污染
+"d.channel_5g=_b===1?d.channel:(_L.channel_5g||149);"
+"if(_b===1)d.channel=(_L.channel||6);"
+// 密码变化要单独提示：改完热点会重建并踢掉本机，必须用新密码重连才回得来
+"const pwChg=(d.ap_password||'')!==(_L.ap_password||'');"
+"try{const r=await fetch('/api/config',{method:'POST',"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});"
+"const j=await r.json();"
+"if(j.ok){msg('已保存并应用 ✓'+(pwChg?' (热点密码已修改，请用新密码重新连接)':(j.restarted?' (SSID/信道/广播间隔变更会重建热点，连接可能短暂中断，请稍候或重新连接)':'')),true);"
+// 保存成功后的地图刷新只是附带 UI 更新：包裹 try + typeof 防护，
+// 无论页面 JS 环境处于什么状态都绝不影响「已保存」的判定与提示
+"try{if(map&&circle){map.removeLayer(circle);circle=null;}"
+"if(typeof drawCircle==='function')drawCircle();}catch(me){}}"
+"else{msg('保存失败: '+(j.err||''),false);}}"
+"catch(e){msg(e&&e.name==='TypeError'?'热点参数已生效，连接被重置，请重新连接热点后刷新确认':'保存失败: '+e,false);}}"
+"async function resetCfg(){if(!confirm('确认恢复全部初始设定？当前配置将被覆盖。'))return;"
+"try{const r=await fetch('/api/reset',{method:'POST'});const j=await r.json();"
+"if(j.ok){msg('已恢复初始设定 ✓'+(j.restarted?' (热点参数变化，请重新连接热点)':''),true);"
+"await load();}else{msg('恢复失败',false);}}"
+"catch(e){msg(e&&e.name==='TypeError'?'已恢复初始设定，连接被重置，请重新连接热点后刷新确认':'恢复失败: '+e,false);}}"
+// ---- 固件升级（OTA）：XHR 裸流上传 + 上传进度 + 重启后自动刷新 ----
+// 不用 fetch 的原因：fetch 拿不到上传进度事件，几百 KB 在热点上要传几秒，
+// 没有进度条用户会以为卡死；XHR 的 upload.onprogress 才能逐块更新。
+"var OTA=null,otaBusy=false,otaPollN=0;"
+// 固件升级面板挂在顶部右上角按钮上：点开才拉取版本信息，升级中不允许关闭
+"function otaOpen(){var m=q('otamask');if(!m)return;m.classList.add('on');otaLoad();}"
+"function otaClose(){if(otaBusy)return;var m=q('otamask');if(m)m.classList.remove('on');}"
+"function otaProg(p){var b=q('otabar'),f=q('otafill');if(!b||!f)return;"
+"b.className='otabar on';"
+"f.style.width=Math.max(0,Math.min(100,p))+'%';}"
+"function otaTxt(t,cls){var e=q('otatxt');if(!e)return;"
+"e.className='otatxt'+(cls?' '+cls:'');e.textContent=t;}"
+"function otaFill(){if(!OTA)return;var v=q('otaver'),p=q('otapart'),c=q('otacan');"
+"var hv=q('otavh');if(hv)hv.textContent='v'+(OTA.ver||'--');"
+"if(v)v.textContent=OTA.ver||'--';"
+"if(p)p.textContent=(OTA.part||'--')+(OTA.part_size?' / '+(OTA.part_size/1048576).toFixed(2)+' MB':'');"
+"if(c)c.textContent=OTA.ota?(OTA.max/1048576).toFixed(2)+' MB':'不可用';}"
+"function otaLoad(){return fetch('/api/ota/info',{cache:'no-store'})"
+".then(function(r){return r.json();})"
+".then(function(j){OTA=j;otaFill();})"
+".catch(function(){otaTxt('升级信息读取失败：页面与固件版本可能不匹配','bad');});}"
+"function otaStart(){if(otaBusy)return;"
+"var fi=q('otafile');var file=fi&&fi.files?fi.files[0]:null;"
+"if(!file){otaTxt('请先选择固件文件 (.bin)','bad');return;}"
+"if(!OTA||!OTA.token){otaTxt('升级信息未就绪，请刷新页面后重试','bad');return;}"
+"if(file.size<32768){otaTxt('文件太小，不是有效固件','bad');return;}"
+"if(OTA.max&&file.size>OTA.max){otaTxt('文件超过分区容量 '+(OTA.max/1048576).toFixed(2)+' MB','bad');return;}"
+"if(!confirm('确认升级固件？\\n\\n文件：'+file.name+'\\n大小：'+(file.size/1048576).toFixed(2)+' MB'"
+"+'\\n当前版本：'+(OTA.ver||'?')+'\\n\\n升级期间请勿断电，完成后设备会自动重启。'))return;"
+"otaBusy=true;var btn=q('otabtn');if(btn)btn.disabled=true;"
+"otaProg(0);otaTxt('正在上传，请勿关闭页面…','');"
+"var x=new XMLHttpRequest();"
+"x.open('POST','/api/ota/upload',true);"
+"x.setRequestHeader('Content-Type','application/octet-stream');"
+"x.setRequestHeader('X-OTA-Token',OTA.token);"
+"x.timeout=180000;"
+"x.upload.onprogress=function(e){if(!e.lengthComputable)return;"
+"var pc=e.loaded/e.total*100;otaProg(pc);"
+"otaTxt('已上传 '+(e.loaded/1024).toFixed(0)+' / '+(e.total/1024).toFixed(0)+' KB（'+pc.toFixed(0)+'%）');};"
+"x.onload=function(){var j=null;try{j=JSON.parse(x.responseText);}catch(e){}"
+"if(x.status===200&&j&&j.ok){otaProg(100);otaTxt('写入完成，设备正在重启…','good');otaWaitReboot();}"
+"else{otaBusy=false;if(btn)btn.disabled=false;"
+"otaTxt('升级失败：'+((j&&j.err)||('HTTP '+x.status))+'（旧固件不受影响）','bad');}};"
+"x.onerror=function(){otaBusy=false;if(btn)btn.disabled=false;"
+"otaTxt('网络中断，升级未完成；设备若已重启请刷新页面确认版本','bad');};"
+"x.ontimeout=function(){otaBusy=false;if(btn)btn.disabled=false;otaTxt('上传超时，已取消','bad');};"
+"x.send(file);}"
+// 重启等待：设备重启后热点会消失几秒，轮询到第一次回包再比对版本
+"function otaWaitReboot(){var t0=Date.now();"
+"var iv=setInterval(function(){"
+"if(Date.now()-t0>60000){clearInterval(iv);otaBusy=false;"
+"var b=q('otabtn');if(b)b.disabled=false;"
+"otaTxt('设备 60 秒内未响应，请手动刷新页面查看版本','bad');return;}"
+"otaPollN++;"
+"fetch('/api/ota/info?n='+otaPollN,{cache:'no-store'})"
+".then(function(r){return r.json();})"
+".then(function(j){clearInterval(iv);otaBusy=false;"
+"var same=(j.ver===OTA.ver);"
+"otaTxt(same?'已重启，版本仍为 '+j.ver+'（上传的可能是同版本固件，或已被回滚）'"
+":'已升级到 '+j.ver+'，正在刷新页面…',same?'bad':'good');"
+"setTimeout(function(){location.reload();},1600);})"
+".catch(function(){});"
+"},2000);}"
+// ---- 模式切换 UI 与接收监测轮询 ----
+"function getRadio(n){const r=document.querySelector('input[name='+n+']:checked');"
+"return r?r.value:'0';}"
+// ---- 按广播标准显隐身份字段（旧国标独有 / 新国标独有） ----
+"function stdUI(){const s=getRadio('std');"
+"const oldOn=(s!=='1'),newOn=(s!=='0');"
+"document.querySelectorAll('.oldstd').forEach(function(e){e.style.display=oldOn?'block':'none';});"
+"document.querySelectorAll('.newstd').forEach(function(e){e.style.display=newOn?'block':'none';});}"
+"document.querySelectorAll('input[name=std]').forEach(function(r){"
+"r.addEventListener('change',stdUI);});"
+"let rxTimer=null;let LASTCFG={};"
+// 工作角色：单射频同一时刻只能发或收，页面用二选一拨动开关承载
+"function roleTx(){const r=document.querySelector('input[name=role]:checked');"
+"return r?r.value==='tx':true;}"
+"function setRole(tx){document.querySelectorAll('input[name=role]').forEach(function(r){"
+"r.checked=(r.value===(tx?'tx':'rx'));});}"
+// 两个频段都允许自由选信道：2.4G 取 1-13，5.8G 取 149-165 且落在 20 MHz
+// 网格上（149/153/157/161/165）。国标 A.1.3.1.3 的「固定信道取 6 / 149」
+// 只作默认值，不限制用户改（测图传干扰、错开多机都用得上）
+"function bandUI(){const b=getRadio('band');const c=fld('channel');if(!c)return;"
+"const lb=document.getElementById('chlbl');"
+"if(b==='1'){c.disabled=false;c.min=149;c.max=165;c.step=4;"
+"if(!(+c.value>=149&&+c.value<=165))c.value=(LASTCFG&&LASTCFG.channel_5g)||149;"
+"if(lb)lb.textContent='Wi-Fi 信道 (149/153/157/161/165)';}"
+"else{c.disabled=false;c.min=1;c.max=13;c.step=1;"
+"if(!(+c.value>=1&&+c.value<=13))c.value=(LASTCFG&&LASTCFG.channel)||6;"
+"if(lb)lb.textContent='Wi-Fi 信道 (1-13)';}}"
+"function modeUI(){const tx=roleTx();const rx=!tx;"
+"document.getElementById('stdbox').style.display=tx?'block':'none';"
+// txonly 恢复显隐用空串（回退样式表 display）：.col 列容器依赖 flex 布局，
+// 若写死 block 会覆盖 flex 导致两列布局塌掉
+"document.querySelectorAll('.txonly').forEach(function(e){e.style.display=tx?'':'none';});"
+"document.getElementById('rxbox').style.display=rx?'block':'none';"
+// 历史轨迹只有接收模式才会落盘，发射模式下整卡不显示（也省掉无用的轮询）
+"const lg=document.getElementById('logbox');if(lg)lg.style.display=rx?'':'none';"
+// 切走时停掉回放定时器，免得在隐藏卡片上空转
+"if(tx&&typeof lgStop==='function')lgStop();"
+"if(rx)logRefresh();"
+"if(rx&&!rxTimer){pollRx();rxTimer=setInterval(pollRx,2000);}"
+"if(!rx&&rxTimer){clearInterval(rxTimer);rxTimer=null;}"
+// 接收端地图：进入接收模式时才按需加载独立脚本，且全程 try 保护，
+// 地图出问题绝不会影响模式切换、参数配置与接收列表
+"if(rx){rxMapLoad();try{if(window.RXMAP)RXMAP.resize();}catch(e){}}"
+"if(tx&&!ginit&&typeof initMap==='function')initMap();}"
+"document.querySelectorAll('input[name=band]').forEach(function(r){"
+"r.addEventListener('change',bandUI);});"
+"document.querySelectorAll('input[name=role]').forEach(function(r){"
+"r.addEventListener('change',modeUI);});"
+// ---- 接收端地图加载器：仅负责把 /rxmap.js 拉进来，逻辑全在独立脚本里 ----
+"let _rxmAsked=false;"
+"function rxMapFail(msg){try{"
+"const b=q('rxmapbox');if(b)b.style.display='none';"
+"let n=q('rxmapfail');"
+"if(!n){n=document.createElement('div');n.className='note';n.id='rxmapfail';"
+"const host=q('rxbox');if(host&&q('rxlist'))host.insertBefore(n,q('rxlist'));}"
+"if(n)n.textContent=msg;}catch(e){}}"
+"function rxMapLoad(){"
+"if(_rxmAsked||window.RXMAP)return;_rxmAsked=true;"
+"const s=document.createElement('script');s.src='/rxmap.js?v=1';"
+"s.onload=function(){try{if(window.RXMAP)RXMAP.boot();}"
+"catch(e){rxMapFail('地图初始化失败，已降级为纯列表模式');}};"
+"s.onerror=function(){_rxmAsked=false;"
+"rxMapFail('地图脚本未加载（需联网），已降级为纯列表模式');};"
+"document.head.appendChild(s);}"
+// ---- 接收监测：卡片式渲染（风格与发射端卡片统一） ----
+// ---- 接收监测：卡片式渲染（风格与发射端卡片统一） ----
+"const RXST=['未报告','地面','空中','紧急','识别失效','识别失效'];"
+"const UATN=['未声明','固定翼','多旋翼','旋翼机','垂直起降固定翼','扑翼机','滑翔机','风筝',"
+"'自由气球','系留气球','飞艇','降落伞','火箭','系留动力飞行器','地面障碍物','其他'];"
+"const GBCN=['微型','轻型','小型','中型','大型'];"
+"function q(id){return document.getElementById(id);}"
+"function esc(s){return String(s===undefined||s===null?'':s)"
+".replace(/[&<>\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c];});}"
+"function f1(v){return (v===null||v===undefined||isNaN(v))?'--':Number(v).toFixed(1);}"
+"function f6(v){return (v===null||v===undefined||isNaN(v))?'--':Number(v).toFixed(6);}"
+"function ageTxt(ms){const s=Math.floor(ms/1000);"
+"return s<60?(s+' 秒前'):(s<3600?(Math.floor(s/60)+' 分前'):(Math.floor(s/3600)+' 时前'));}"
+"function rxProto(p){"
+"if(p===4)return {c:'g46750',t:'GB46750',col:'#5b21b6'};"
+"if(p===3)return {c:'g42590',t:'GB42590',col:'#0369a1'};"
+"return {c:'astm',t:'ASTM',col:'#64748b'};}"
+// 4 格信号柱：按 RSSI 分级着色（强绿 / 中黄 / 弱红）
+"function sigBar(r){"
+"const lv=r>=-55?4:(r>=-67?3:(r>=-78?2:(r>=-90?1:0)));"
+"const cls=lv>=3?'':(lv===2?'w':'weak');"
+"let h=`<div class=\"sig\" title=\"${r} dBm\">`;"
+"for(let i=1;i<=4;i++){const on=i<=lv;"
+"h+=`<i class=\"${on?'on '+(lv>0?cls:''):''}\" style=\"height:${4+i*2.5}px\"></i>`;}"
+"return h+'</div>';}"
+"function cell(v,unit,label,cls){"
+"return `<div class=\"${cls||''}\"><b>${v}${unit?`<small>${unit}</small>`:''}</b><span>${label}</span></div>`;}"
+// ---- 导航到目标位置：直接调起手机地图 App（高德 / 百度），不是打开网页 ----
+// 用各家原生 URL Scheme：高德 amapuri://route/plan（iOS: iosamap://path）、
+// 百度 bdapp://map/direction（iOS: baidumap://map/direction）。
+// 坐标仍传 GNSS 原始 WGS-84：高德 dev=1 = 需要国测加密（由 App 自己转 GCJ-02）；
+// 百度带 coord_type=wgs84 同理。App 没装（1.5 秒内没跳走）才降级到网页版。
+"function posOk(la,lo){la=Number(la);lo=Number(lo);"
+"return isFinite(la)&&isFinite(lo)&&Math.abs(la)<=90&&Math.abs(lo)<=180"
+"&&!(Math.abs(la)<1e-6&&Math.abs(lo)<1e-6);}"   // 0,0 视为未上报
+"function isIOS(){return /iPad|iPhone|iPod/.test(navigator.userAgent||'');}"
+"function navDestName(kind,nm){"
+"const tag=(kind==='op')?'飞手':'无人机';"
+"const base=(nm?nm:tag);"
+"return base.slice(0,40);}"
+// 原生 App 的 scheme。alt=1 时换用各家的备用协议头（百度 Android 上
+// bdapp:// 与 baidumap:// 都有人注册，两个都试能明显提高唤起成功率）
+"function navScheme(kind,la,lo,nm,prov,alt){"
+"la=Number(la);lo=Number(lo);"
+"const dn=encodeURIComponent(navDestName(kind,nm));"
+"if(prov==='bd'){"
+"const dest='latlng:'+la.toFixed(6)+','+lo.toFixed(6)+'|name:'+dn;"
+"const ios=isIOS();"
+"const head=alt?(ios?'bdapp://map/direction?':'baidumap://map/direction?')"
+":(ios?'baidumap://map/direction?':'bdapp://map/direction?');"
+"return head+'destination='+dest+"
+"'&mode=driving&coord_type=wgs84&src=webapp.crid.nav';}"
+"return (isIOS()?'iosamap://path?':'amapuri://route/plan/?')"
+"+'sourceApplication=crid&dlat='+la.toFixed(6)+'&dlon='+lo.toFixed(6)"
+"+'&dname='+dn+'&dev=1&t=0';}"
+"function navSchemes(kind,la,lo,nm,prov){"
+"const a=navScheme(kind,la,lo,nm,prov,0);"
+"if(prov==='bd')return [a,navScheme(kind,la,lo,nm,prov,1)];"
+"return [a];}"
+// 网页版兜底（App 未安装时）
+"function navUrl(kind,la,lo,nm,prov){"
+"la=Number(la);lo=Number(lo);"
+"const name=navDestName(kind,nm);"
+"if(prov==='bd'){"
+"return 'https://api.map.baidu.com/mobile/direction?destination=latlng:'"
+"+la.toFixed(6)+','+lo.toFixed(6)+'|name:'+encodeURIComponent(name)"
+"+'&mode=driving&output=html&coord_type=wgs84&src=webapp.crid.nav';}"
+"return 'https://uri.amap.com/navigation?to='+lo.toFixed(6)+','+la.toFixed(6)+','"
+"+encodeURIComponent(name)+'&mode=car&policy=1&coordinate=wgs84&src=crid';}"
+// 唤起策略：逐个尝试 scheme（每个给 900ms），全部失败才降级网页版。
+// 只要页面被切到后台（App 起来了）就立刻停止后续尝试。
+"function navTo(kind,la,lo,nm,prov){"
+"if(!posOk(la,lo)){msg('该目标暂未上报有效坐标，无法导航',false);return;}"
+"const list=navSchemes(kind,la,lo,nm,prov);"
+"const web=navUrl(kind,la,lo,nm,prov);"
+"let i=0,jumped=false,tm=null;"
+"const stop=function(){jumped=true;if(tm){clearTimeout(tm);tm=null;}"
+"document.removeEventListener('visibilitychange',stop);"
+"window.removeEventListener('blur',stop);"
+"window.removeEventListener('pagehide',stop);};"
+"document.addEventListener('visibilitychange',stop);"
+"window.addEventListener('blur',stop);"
+"window.addEventListener('pagehide',stop);"
+"const next=function(){"
+"if(jumped)return;"
+"if(i>=list.length){"
+"if(document.visibilityState!=='hidden'){try{location.href=web;}catch(e){}}"
+"return;}"
+"try{location.href=list[i++];}catch(e){}"
+"tm=setTimeout(next,900);};"
+"next();}"
+// 点按钮先弹地图选择层（高德/百度二选一），选完才跳转，页面不常驻多余控件
+"const NP={kind:'drone',la:0,lo:0,nm:''};"
+"function navClose(){const m=q('navpick');if(m)m.classList.remove('on');}"
+"function navPick(kind,la,lo,nm){"
+"if(!posOk(la,lo)){msg('该目标暂未上报有效坐标，无法导航',false);return;}"
+"NP.kind=kind;NP.la=Number(la);NP.lo=Number(lo);NP.nm=nm||'';"
+"const t=q('navpick_t');if(t)t.textContent='导航到'+((kind==='op')?'飞手位置':'无人机位置');"
+"const p=q('navpick_p');"
+"if(p)p.textContent=navDestName(kind,nm)+' · '+NP.la.toFixed(6)+', '+NP.lo.toFixed(6)+'（WGS-84）';"
+"const m=q('navpick');if(m)m.classList.add('on');}"
+"function navGo(prov){navClose();"
+"navTo(NP.kind,NP.la,NP.lo,NP.nm,prov);}"
+"function navBtn(kind,la,lo,nm){"
+"const tag=(kind==='op')?'飞手':'无人机';"
+"return '<button type=\"button\" class=\"navbtn\" data-nav=\"'+kind+'\"'"
+"+' data-la=\"'+Number(la).toFixed(6)+'\" data-lo=\"'+Number(lo).toFixed(6)+'\"'"
+"+' data-nm=\"'+esc(nm||'')+'\">导航到'+tag+'</button>';}"
+// ---- 报文详情折叠：枚举值文本表（国标与 ASTM 兼容枚举） ----
+"const OPT=['实时位置','起飞点位置','自定义位置','未知'];"
+"const AGLT=['起飞点','地面','自定义','实时 GNSS'];"
+"const HACC=['未知','<18.5 km','<7.4 km','<3.7 km','<1.85 km','<926 m','<556 m','<185 m',"
+"'<93 m','<30 m','<10 m','<3 m','<1 m'];"
+"const VACC=['未知','<150 m','<45 m','<25 m','<10 m','<3 m','<1 m'];"
+"const SACC=['未知','<10 m/s','<3 m/s','<1 m/s','<0.3 m/s'];"
+"const TACC=['未知','<=0.2 s','<=0.5 s','<=1 s','<=2 s','<=5 s','<=10 s','<=20 s',"
+"'<=30 s','<=60 s','>60 s'];"
+// 折叠状态按 mac 记忆：轮询每 2 秒重建 DOM 后恢复各卡展开态
+"const s_fold={};"
+"function updFoldBtn(){const b=q('foldall');if(!b)return;"
+"const cs=document.querySelectorAll('#rxlist .dcard');"
+"const allOpen=cs.length>0&&Array.prototype.every.call(cs,function(c){return c.classList.contains('open');});"
+"b.textContent=allOpen?'全部折叠 ▴':'全部展开 ▾';}"
+"function foldAll(){const cs=document.querySelectorAll('#rxlist .dcard');"
+"const anyClosed=Array.prototype.some.call(cs,function(c){return !c.classList.contains('open');});"
+"Array.prototype.forEach.call(cs,function(c){c.classList.toggle('open',anyClosed);"
+"s_fold[c.dataset.mac]=anyClosed;});updFoldBtn();}"
+// 详情块：报文携带的全部数据项（括号内为国标数据项编号）。
+// 卡片折叠态只留关键几项，其余全部收在这里——操作员 ID、MAC、机型分类、
+// 精度、时间戳、链路统计一项不少，保证「收到的信息都能查到」。
+"function dtlHtml(t){"
+"const p=rxProto(t.protocol);"
+"const rows=[];const row=function(k,v){if(v!==undefined&&v!==null&&v!=='')rows.push("
+"'<tr><td>'+k+'</td><td>'+v+'</td></tr>');};"
+"const txt=function(k,v){row(k,(v===undefined||v===null||v==='')?undefined:esc(v));};"
+// ---- 身份信息 ----
+"txt('MAC 地址',t.mac);"
+"txt('UAS ID (序列号)',t.uas_id);"
+"txt('机型 / 描述',t.drone_name);"
+"row('标准 / 协议',p.t+' · 协议号 '+t.protocol);"
+"row('机型分类',t.protocol===4"
+"?('新国标分类 '+t.ua_type+' · '+(GBCN[t.ua_type]||'未定义'))"
+":('机型代码 '+t.ua_type+' · '+(UATN[t.ua_type]||'未定义')));"
+"txt('第二识别码',t.uas_id2);"
+"txt('操作员 ID',t.operator_id);"
+"txt('实名登记号',t.realname_id);"
+"row('运行状态',RXST[t.status]||('状态 '+t.status));"
+// ---- 位置与运动 ----
+"row('纬度',f6(t.latitude));"
+"row('经度',f6(t.longitude));"
+"row('大地高度 (013)',f1(t.altitude_geo)+' m');"
+"row('相对高度 (011)',t.altitude_agl===undefined?undefined:"
+"f1(t.altitude_agl)+' m'+(t.agl_type!==undefined?' · '+AGLT[t.agl_type]:''));"
+"row('气压高度 (014)',t.altitude_baro===undefined?undefined:f1(t.altitude_baro)+' m');"
+"row('水平速度',f1(t.speed_horizontal)+' m/s');"
+"row('垂直速度 (012)',f1(t.speed_vertical)+' m/s');"
+"row('航向',f1(t.direction)+' °');"
+"if(t.has_op_loc){"
+"row('飞手纬度',f6(t.op_latitude));"
+"row('飞手经度',f6(t.op_longitude));"
+"row('飞手海拔 (007)',f1(t.op_altitude_geo)+' m');"
+"}"
+// ---- 精度与时间戳 ----
+"if(t.protocol===4){"
+"row('遥控站位置类型 (005)',OPT[t.op_loc_type!==undefined?t.op_loc_type:3]);"
+"row('坐标系 (016)',t.coord_sys===undefined?undefined:"
+"(t.coord_sys===0?'WGS-84':'类型 '+t.coord_sys));"
+"row('水平精度 (017)',t.h_acc===undefined?undefined:(HACC[t.h_acc]||('枚举 '+t.h_acc)));"
+"row('垂直精度 (018)',t.v_acc===undefined?undefined:(VACC[t.v_acc]||('枚举 '+t.v_acc)));"
+"row('速度精度 (019)',t.spd_acc===undefined?undefined:(SACC[t.spd_acc]||('枚举 '+t.spd_acc)));"
+"row('报文时间 (020)',t.ts_unix_ms===undefined?undefined:"
+"new Date(t.ts_unix_ms).toLocaleTimeString());"
+"row('时间戳精度 (021)',t.ts_acc===undefined?undefined:(TACC[t.ts_acc]||('枚举 '+t.ts_acc)));"
+"}else{"
+"row('报文时间 (相对)',t.ts_rel_10s===undefined?undefined:f1(t.ts_rel_10s/10)+' s');"
+"row('水平精度',t.h_acc===undefined?undefined:(HACC[t.h_acc]||('枚举 '+t.h_acc)));"
+"row('垂直精度',t.v_acc===undefined?undefined:(VACC[t.v_acc]||('枚举 '+t.v_acc)));"
+"row('速度精度',t.spd_acc===undefined?undefined:(SACC[t.spd_acc]||('枚举 '+t.spd_acc)));"
+"row('高度基准',t.agl_type===undefined?undefined:(AGLT[t.agl_type]||('类型 '+t.agl_type)));"
+"}"
+// ---- 链路与统计 ----
+"row('信道',t.channel);"
+"row('信号强度 (RSSI)',t.rssi===undefined?undefined:t.rssi+' dBm');"
+"row('累计帧数',t.msg_count===undefined?undefined:t.msg_count+' 帧');"
+"row('最后收到',t.age_ms===undefined?undefined:ageTxt(t.age_ms));"
+"row('在线状态',t.active===false?'已离线（10 秒无信号，保留 30 分钟）':'在线');"
+"row('已观测时长',t.first_age_ms===undefined?undefined:ageTxt(t.first_age_ms));"
+"if(!rows.length)return '';"
+"return '<div class=\"dtl\"><div class=\"dtl-h\">报文详情 ('+rows.length+' 项)<i>▶</i></div>'"
+"+'<div class=\"dtl-b\"><table class=\"dtab\">'+rows.join('')+'</table></div></div>';}"
+"function rxCard(t){"
+"const p=rxProto(t.protocol);"
+"const el=document.createElement('div');"
+"el.className='dcard'+(t.active===false?' off':'');"
+"el.dataset.mac=t.mac;"
+"const stTxt=RXST[t.status]||('状态'+t.status);"
+"const air=(t.status===2);"
+// 机型描述：新国标无 Self-ID 数据项，用分类兜底
+"let name=t.drone_name||'';"
+"if(!name)name=(t.protocol===4)?('新国标 '+(GBCN[t.ua_type]||('分类'+t.ua_type))):'未广播机型名';"
+// 链路与统计并入机型标题行右侧：MAC · 信号 · 帧数 · 最后收到
+"const lnk=esc(t.mac)+' · '+t.rssi+' dBm · '+t.msg_count+' 帧 · '+ageTxt(t.age_ms);"
+"let h=`<div class=\"dh\"><span class=\"id\" title=\"${esc(t.uas_id)}\">${esc(t.uas_id||'(无 UAS ID)')}</span>`"
+"+`<span class=\"tag ${p.c}\">${p.t}</span>`"
+"+`<span class=\"tag ${air?'air':'pend'}\">${esc(stTxt)}</span>`"
+"+sigBar(t.rssi)+`</div><div class=\"db\">`;"
+"h+=`<div class=\"dname\"><span class=\"nm\" title=\"${esc(name)}\">${esc(name)}</span>`"
+"+`<span class=\"lnk\" title=\"链路与统计：MAC · 信号强度 · 累计帧数 · 最后收到\">${lnk}</span></div>`;"
+"h+=`<div class=\"kv\">`"
+"+cell(f6(t.latitude),'','纬度','hl')"
+"+cell(f6(t.longitude),'','经度','hl')"
+"+cell(f1(t.altitude_geo),'m','大地高度')"
+"+cell(f1(t.speed_horizontal),'m/s','水平速度')"
+"+cell(f1(t.direction),'°','航向')"
+"+cell(f1(t.speed_vertical),'m/s','垂直速度')"
+"+`</div>`;"
+// 副信息行：飞手位置与实名登记号同一行；操作员 ID 收进报文详情，不再占版面
+"const idt=[];"
+"if(t.has_op_loc)idt.push([f6(t.op_latitude)+', '+f6(t.op_longitude),'飞手位置 (遥控站)']);"
+"if(t.realname_id)idt.push([esc(t.realname_id),'实名登记号']);"
+"if(idt.length){h+='<div class=\"kv2\">';"
+"idt.forEach(function(x){"
+"h+='<div'+(idt.length===1?' class=\"wide\"':'')+'><b>'+x[0]+'</b><span>'+x[1]+'</span></div>';});"
+"h+='</div>';}"
+// 导航按钮：分别导航到无人机当前位置 / 飞手（遥控站）位置，无有效坐标则不显示。
+// 目的地名称用机型名（如 DJI Air 3S）而不是 20 位序列号——序列号在地图 App 里
+// 只会显示成一串乱码，用户看不出这是哪架无人机
+"let nb='';"
+"if(posOk(t.latitude,t.longitude))nb+=navBtn('drone',t.latitude,t.longitude,t.drone_name);"
+"if(t.has_op_loc&&posOk(t.op_latitude,t.op_longitude))"
+"nb+=navBtn('op',t.op_latitude,t.op_longitude,'');"
+"if(nb)h+='<div class=\"navrow\">'+nb+'</div>';"
+"h+=dtlHtml(t)+'</div>';"
+"el.innerHTML=h;"
+// 折叠头点击：切换展开态（阻断冒泡，不触发卡片本身的地图聚焦）
+"const dh=el.querySelector('.dtl-h');"
+"if(dh){dh.onclick=function(ev){ev.stopPropagation();"
+"el.classList.toggle('open');s_fold[t.mac]=el.classList.contains('open');updFoldBtn();};}"
+// 导航按钮：必须阻断冒泡，否则会连带触发下面卡片的地图聚焦
+"Array.prototype.forEach.call(el.querySelectorAll('.navbtn'),function(b){"
+"b.onclick=function(ev){ev.stopPropagation();"
+"navPick(b.dataset.nav,b.dataset.la,b.dataset.lo,b.dataset.nm);};});"
+// 点击卡片聚焦地图：仅调用已加载的独立模块，未加载或报错都不影响卡片本身
+"el.onclick=function(){try{if(window.RXMAP)RXMAP.focus(t.mac);}catch(e){}};"
+"return el;}"
+""
+"async function pollRx(){"
+// 升级上传期间暂停轮询：httpd 只有 7 个 socket，多余的并发请求会挤掉
+// 正在传输的升级连接（LRU 回收），白白中断升级
+"if(otaBusy)return;"
+"try{"
+"const r=await fetch('/api/rx');const j=await r.json();"
+"try{if(window.RXMAP)RXMAP.update(j.tracks);}catch(e){}"   // 地图刷新独立保护
+"const s=j.stats;"
+// 在线/离线分组：active=false 为离线（后端 10 秒无信号标记，保留 30 分钟后清除）
+"const on=[],off=[];"
+"j.tracks.forEach(function(t){(t.active===false?off:on).push(t);});"
+"on.sort(function(a,b){return b.rssi-a.rssi;});"
+"off.sort(function(a,b){return a.age_ms-b.age_ms;});"
+"q('s_online').textContent=on.length;"
+"q('s_rid').textContent=s.rid;"
+"q('s_total').textContent=s.total;"
+"q('s_ok').textContent=s.ok;"
+"q('s_ovf').textContent=s.ovf;"
+"q('s_ovfbox').className='chip'+((s.ovf>0)?' warn':'');"
+"let fresh=0;"
+"on.forEach(function(t){if(t.age_ms<3000)fresh++;});"
+"q('rxstate').innerHTML=(fresh>0?`<b style=\"color:#0a7d43\">${fresh} 个目标</b>信号良好（3 秒内）`"
+":'暂未收到 RID 帧，持续监听中…')+` &nbsp;|&nbsp; 更新于 ${new Date().toLocaleTimeString()}`;"
+// 列表分区：在线在上（按信号强度），已离线灰度在下（按最后收到时间）
+"const box=q('rxlist');"
+"box.innerHTML='';"
+"if(!on.length&&!off.length){"
+"box.innerHTML='<div class=\"rxb0\"><b>◎</b>尚未发现无人机 RID 广播<br>周边设备需与本机处于同一 Wi-Fi 信道</div>';"
+"return;}"
+"function sec(txt,dim){const d=document.createElement('div');"
+"d.className='rxsec'+(dim?' dim':'');d.textContent=txt;box.appendChild(d);}"
+"if(on.length){sec('在线信号 · '+on.length,false);"
+"on.forEach(function(t){box.appendChild(rxCard(t));});}"
+"if(off.length){sec('已离线 · '+off.length+'（10 秒无信号，保留 30 分钟）',true);"
+"off.forEach(function(t){box.appendChild(rxCard(t));});}"
+// 轮询重建 DOM 后：恢复各卡展开态 + 同步折叠按钮文字
+"Array.prototype.forEach.call(box.querySelectorAll('.dcard'),function(c){"
+"if(s_fold[c.dataset.mac])c.classList.add('open');});"
+"updFoldBtn();"
+"}catch(e){q('rxstate').textContent='轮询失败：'+e;}}"
+"q('foldall').onclick=foldAll;"
+// 导航选择层：选项按钮与取消/点遮罩关闭，只在弹层内有效，不影响页面其它点击
+"(function(){"
+"const m=q('navpick');if(!m)return;"
+"m.onclick=function(ev){if(ev.target===m)navClose();};"
+"Array.prototype.forEach.call(m.querySelectorAll('.navopt'),function(b){"
+"b.onclick=function(ev){ev.stopPropagation();navGo(b.getAttribute('data-prov'));};});"
+"const c=q('navpick_c');if(c)c.onclick=navClose;"
+"})();"
+// ---- 在线地图（Leaflet）与离线网格双模式 ----
+// map/opMarker/circle 等变量已在脚本开头统一声明
+"let gbase=[0,0],gpick=null;"
+"function dotIcon(c){return L.divIcon({className:'',"
+"html:'<div style=\"width:14px;height:14px;border-radius:50%;background:'+c+"
+"';border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4)\"></div>',"
+"iconSize:[14,14],iconAnchor:[7,7]});}"
+"function drawCircle(){if(!map)return;if(circle){map.removeLayer(circle);circle=null;}"
+"const r=(parseFloat(fld('patrol_radius_lat').value)||0)*111320;"
+"if(r>0&&dMarker){circle=L.circle(dMarker.getLatLng(),{radius:r,color:'#0a7d43',"
+"weight:1,fillOpacity:.05}).addTo(map);}}"
+"function initMap(){"
+"if(ginit){syncMarkers();return;}"
+"ginit=true;const o=opLL(),d=baseLL();"
+"if(typeof L!=='undefined'&&!window._mapfail){"
+"map=L.map('map').setView(o,15);"                     // 地图默认以飞手位置为中心
+"L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',"
+"{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(map);"
+"opMarker=L.marker(o,{draggable:true,icon:dotIcon('#c0392b')}).addTo(map);"
+"dMarker=L.marker(d,{draggable:true,icon:dotIcon('#0a7d43')}).addTo(map);"
+"opMarker.on('dragend',function(e){const p=opMarker.getLatLng();"
+"applyPick('op',p.lat,p.lng);});"
+"dMarker.on('dragend',function(e){const p=dMarker.getLatLng();"
+"applyPick('drone',p.lat,p.lng);});"
+"map.on('click',function(e){applyPick(ptarget(),e.latlng.lat,e.latlng.lng);});"
+"live=L.circleMarker(d,{radius:6,color:'#1565c0',fillColor:'#1565c0',"
+"fillOpacity:.9}).addTo(map);"
+"drawCircle();}"
+"else{document.getElementById('map').style.display='none';"
+"document.getElementById('gridbox').style.display='block';"
+"gbase=o;drawGrid();"                                  // 离线网格同样以飞手为中心
+"document.getElementById('mpp').onchange=function(){drawGrid();};"
+"const cv=document.getElementById('grid');"
+"cv.addEventListener('click',function(e){"
+"const rc=cv.getBoundingClientRect();const s=320/rc.width;"
+"const x=(e.clientX-rc.left)*s,y=(e.clientY-rc.top)*s;"
+"const mpp=parseFloat(fld('mpp').value);"
+"const dx=(x-160)*mpp,dy=(160-y)*mpp;"
+"const la=gbase[0]+dy/111320;"
+"const lo=gbase[1]+dx/(111320*Math.cos(gbase[0]*Math.PI/180));"
+"applyPick(ptarget(),la,lo);gpick=[la,lo];drawGrid();});}}"
+"function drawGrid(){const cv=document.getElementById('grid');"
+"if(!cv)return;"
+"const x=cv.getContext('2d');"
+"x.fillStyle='#fafafa';x.fillRect(0,0,320,320);"
+"x.strokeStyle='#e2e2e2';"
+"for(let i=0;i<=320;i+=40){x.beginPath();x.moveTo(i,0);x.lineTo(i,320);x.stroke();"
+"x.beginPath();x.moveTo(0,i);x.lineTo(320,i);x.stroke();}"
+"x.strokeStyle='#999';x.beginPath();x.moveTo(160,0);x.lineTo(160,320);"
+"x.moveTo(0,160);x.lineTo(320,160);x.stroke();"
+"x.fillStyle='#555';x.font='11px sans-serif';"
+"x.fillText(fld('mpp').value+'米/像素',8,312);"
+"x.fillStyle='#0a7d43';x.beginPath();x.arc(160,160,6,0,6.3);x.fill();"
+"x.fillStyle='#0a7d43';x.fillText('中心=基准点',170,164);"
+// 飞行轨迹（蓝线）：与在线地图同数据源，网格模式下同样可见
+"if(trailPts.length>1){const tm=parseFloat(fld('mpp').value);"
+"x.strokeStyle='rgba(21,101,192,.55)';x.lineWidth=2;x.beginPath();"
+"trailPts.forEach(function(p,i){"
+"const px=160+(p[1]-gbase[1])*111320*Math.cos(gbase[0]*Math.PI/180)/tm;"
+"const py=160-(p[0]-gbase[0])*111320/tm;"
+"if(i)x.lineTo(px,py);else x.moveTo(px,py);});x.stroke();x.lineWidth=1;}"
+"if(gpick){const mpp=parseFloat(fld('mpp').value);"
+"const px=160+(gpick[1]-gbase[1])*111320*Math.cos(gbase[0]*Math.PI/180)/mpp;"
+"const py=160-(gpick[0]-gbase[0])*111320/mpp;"
+"x.fillStyle='#c0392b';x.beginPath();x.arc(px,py,6,0,6.3);x.fill();}}"
+// ---- 发射端飞行轨迹：每 2 秒把实时广播位置追加进轨迹 ----
+// 与接收端航迹（独立 /rxmap.js 模块内实现）互不相干
+"function trailPush(la,lo){const n=trailPts.length;"
+"if(n){const dla=la-trailPts[n-1][0],dlo=lo-trailPts[n-1][1];"
+"if(Math.abs(dla)>0.005||Math.abs(dlo)>0.005){trailPts=[];}"   // 位置跳变（改基准点/保存应用）后重新起线
+"else if(Math.abs(dla)>1e-7||Math.abs(dlo)>1e-7)trailPts.push([la,lo]);}"
+"else{trailPts.push([la,lo]);}"
+"if(trailPts.length>240)trailPts.shift();"   // 保留最近 240 点（约 8 分钟巡游）
+"if(map){if(!trailLine)trailLine=L.polyline(trailPts,"
+"{color:'#1565c0',weight:2,opacity:.6}).addTo(map);"
+"else trailLine.setLatLngs(trailPts);}}"
+// ---- 实时广播位置轮询 ----
+"async function poll(){if(otaBusy)return;try{const r=await fetch('/api/status');const j=await r.json();"
+"const t='实时广播位置: '+j.latitude.toFixed(6)+', '+j.longitude.toFixed(6)+"
+"'  高度 '+j.altitude_msl.toFixed(1)+'m  航向 '+j.heading.toFixed(0)+'°';"
+"document.getElementById('liveinfo').textContent=t;"
+"if(live){live.setLatLng([j.latitude,j.longitude]);}"
+"trailPush(j.latitude,j.longitude);"
+"tStat(!!j.tsync,j.tnow);tLast=j.tsync?1:0;}"
+"catch(e){}"
+"tAuto();}"
+// ---- 设备授时：GB46750 数据项 020 需要真实 Unix 毫秒，设备本身无 RTC/不联网 ----
+"var sT=0,tTries=0,tDone=false,tBad='',tNext=0,tLast=-1;"
+// 授时状态条：设备有没有拿到真实时间，一眼能看见。未校准时报文里的时间字段
+// 一律按标准写「未知」，绝不拿「1970+开机秒数」冒充真实时间。tBad 缓存上次
+// 失败原因，这样每 2 秒的轮询不会把「为什么失败」刷掉。
+"function tClock(sec){var d=new Date(sec*1000);"
+"return pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());}"
+"function tStat(ok,sec){var e=document.getElementById('tstat');if(!e)return;"
+"if(ok&&sec){tBad='';e.className='ok';"
+"e.textContent='时间已校准 · 设备时钟 '+tClock(sec)+'（报文按此时间发送）';}"
+"else if(tBad){e.className='bad';"
+"e.textContent='授时失败 · '+tBad+'（报文时间按「未知」发送）';}"
+"else{e.className='';e.textContent='时间未校准 · 报文时间字段按「未知」发送';}}"
+// 何时该自动授时：每 10 分钟刷一次（防手机时间被调整），另外设备重启/OTA 后
+// 校准会丢失，tLast 从 1 变 0 时立刻补一次——否则用户要干等 10 分钟才恢复。
+"function tAuto(){if(tTries>0)return;if(Date.now()<tNext)return;"
+"if(Date.now()-sT>600000){syncTime();return;}"
+"if(tLast===0)syncTime();}"
+// ---- 历史轨迹：统计、目标列表、分页轨迹点、航线回放、导出与清空 ----
+// 分页固定 30 条一页、最多 10 页（最近 300 条可在线翻），更早的走 CSV
+"let lgMac='',lgPage=0,lgPts=[],lgPlay=-1,lgTimer=null,lgRate=1;"
+// 记录开关：默认关闭，状态由设备保存（NVS），页面每次打开都从 /api/log/info 回填。
+// 授时不再自动打开记录——开关完全由用户手动决定，避免「以为没开却在写」或反之。
+"let lgOn=false;"
+"function lgSw(on){lgOn=!!on;var b=document.getElementById('lgsw');if(!b)return;"
+"b.textContent='记录：'+(lgOn?'开':'关');b.classList.toggle('on',lgOn);}"
+"async function lgEnable(on){try{var r;"
+"if(bleOn){r=await fetch('/api/log/enable?on='+(on?1:0));}"
+"else{r=await fetch('/api/log/enable',{method:'POST',"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify({on:on?1:0})});}"
+"const j=await r.json();if(j&&j.ok){lgSw(j.on);return true;}}catch(e){}return false;}"
+"function logToggle(){const want=!lgOn;lgEnable(want).then(function(ok){if(!ok){lgSw(lgOn);"
+"msg('记录开关失败',false);return;}msg(want?'轨迹记录已开启（已保存）':'轨迹记录已关闭（已保存）',true);"
+"if(want)logRefresh();});}"
+// 回放要的是整个 300 条航线，不是当前页那 30 条：
+// lgPages[p] 缓存第 p 页（已翻成旧->新），lgPath 是各页按时间拼成的完整航线
+"let lgPath=[],lgPages=[],lgMatched=0,lgLoading=false;"
+"let lgOpen='';"
+"let lgHasMap=false;"
+"const LG_PER=30,LG_MAXP=10;"
+"function fmtKB(n){n=Number(n)||0;if(n>=1048576)return (n/1048576).toFixed(2)+' MB';"
+"return (n/1024).toFixed(0)+' KB';}"
+"function pad2(x){return String(x).padStart(2,'0');}"
+"function fmtT(u,t){"
+"if(u>0){const d=new Date(u*1000);"
+"return d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+' '+"
+"pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());}"
+"const s=Math.floor((t||0)/1000);"
+"return '上电 '+pad2(Math.floor(s/3600))+':'+pad2(Math.floor(s%3600/60))+':'+pad2(s%60);}"
+// 卡片标题就是折叠开关：点一下收起整块内容，再点展开（原来只能打开、收不回去）
+"function logFold(){"
+"const b=q('lgbody'),h=q('lghd');if(!b)return;"
+"const fold=(b.style.display!=='none');"
+"b.style.display=fold?'none':'';"
+"if(h)h.className='lghd'+(fold?'':' open');"
+"const t=q('lgtog');if(t)t.textContent=fold?'展开':'收起';"
+"if(!fold)lgResize();}"
+"function logTargets(j){"
+"const box=q('lgtargets');if(!box)return;"
+"const ts=j.targets||[];"
+"if(!ts.length){box.innerHTML='<div class=\"lgmore\">还没有记录。切到接收模式并等周边无人机出现，这里就会列出目标。</div>';return;}"
+"let h='';"
+"for(let i=0;i<ts.length;i++){const t=ts[i];"
+"const sel=(t.mac===lgMac)?' sel':'';"
+"h+='<div class=\"lgrow'+sel+'\" data-mac=\"'+t.mac+'\">'"
+"+'<span class=\"id\">'+(t.uid?esc(t.uid):'(无 UAS ID)')+'</span>'"
+"+'<span class=\"mono\">'+String(t.mac).toUpperCase()+'</span>'"
+"+'<span class=\"sp\"></span>'"
+"+'<span class=\"mini\">'+t.count+' 条 · 最后 '+fmtT(t.newest_unix,t.newest_tick)+'</span>'"
+"+'<button type=\"button\" data-lg=\"'+t.mac+'\">看轨迹</button>'"
+"+'<button type=\"button\" class=\"lgdel\" data-del=\"'+t.mac+'\">删除</button>'"
+"+'</div>';}"
+"box.innerHTML=h;"
+"Array.prototype.forEach.call(box.querySelectorAll('button[data-lg]'),function(b){"
+"b.onclick=function(){logPoints(b.dataset.lg);};});"
+"Array.prototype.forEach.call(box.querySelectorAll('button[data-del]'),function(b){"
+"b.onclick=function(){logDel(b.dataset.del);};});}"
+"function lgMarkSel(){const box=q('lgtargets');if(!box)return;"
+"Array.prototype.forEach.call(box.querySelectorAll('.lgrow'),function(r){"
+"r.className='lgrow'+(r.getAttribute('data-mac')===lgMac?' sel':'');});}"
+// 打开某目标的轨迹；再点同一个目标就是收起（以前只能打开、收不回去）
+"async function logPoints(mac,page){"
+"if(mac===lgOpen&&typeof page==='undefined'){logClose();return;}"
+"const same=(mac===lgMac);"
+"lgOpen=mac;lgMac=mac;"
+"if(typeof page==='number')lgPage=page;else if(!same)lgPage=0;"
+"lgStop();lgPlay=-1;lgPts=[];lgPath=[];lgPages=[];lgMatched=0;lgLoading=false;"
+"const d=q('lgdet');if(d)d.style.display='';"
+"const w=q('lgwho');if(w)w.textContent=String(mac).toUpperCase()+' · 航线回放';"
+"lgMarkSel();"
+"await lgFetch();}"
+"function logClose(){"
+"lgStop();lgOpen='';lgMac='';lgPts=[];lgPath=[];lgPages=[];lgMatched=0;lgLoading=false;lgPlay=-1;lgPage=0;lgHasMap=false;"
+"try{if(window.RXMAP&&RXMAP.replayEnd)RXMAP.replayEnd();}catch(e){}"
+"const d=q('lgdet');if(d)d.style.display='none';"
+"const b=q('lgpoints');if(b)b.innerHTML='';"
+"const p=q('lgpage');if(p)p.innerHTML='';"
+"lgMarkSel();}"
+"function lgRev(a){return (a||[]).slice().reverse();}"
+"function lgPageCount(){"
+"let n=Math.ceil(lgMatched/LG_PER);if(n<1)n=1;if(n>LG_MAXP)n=LG_MAXP;return n;}"
+"function lgAllLoaded(){"
+"const n=lgPageCount();"
+"for(let p=0;p<n;p++){if(!lgPages[p])return false;}return true;}"
+// 逐页都是「新->旧」取的，翻过来后页号越小越新；拼航线要从最后一页往前接，
+// 同时把 pg/ri 记在点上，回放跨页时表格才知道该翻到哪一页的哪一行
+"function lgRebuildPath(){"
+"const arr=[];"
+"for(let p=lgPages.length-1;p>=0;p--){const a=lgPages[p];if(!a)continue;"
+"for(let i=0;i<a.length;i++){a[i].pg=p;a[i].ri=i;arr.push(a[i]);}}"
+"lgPath=arr;}"
+"async function lgFetch(){"
+"const box=q('lgpoints');"
+"if(box)box.innerHTML='<div class=\"lgmore\">读取中…</div>';"
+"const who=lgMac;"
+"try{"
+"const r=await fetch('/api/log/points?limit='+LG_PER+'&offset='+(lgPage*LG_PER)"
+"+'&mac='+encodeURIComponent(lgMac));"
+"const j=await r.json();"
+"if(who!==lgMac)return;"
+"lgMatched=Number(j.matched||0)||0;"
+"lgPages[lgPage]=lgRev(j.points);"
+"lgPts=lgPages[lgPage];"
+"lgPlay=-1;"
+"lgRebuildPath();"
+"lgRender();lgPager();lgNow();"
+"lgPathDraw();"
+"if(!lgAllLoaded())lgFill();"
+"}catch(e){if(box)box.innerHTML='<div class=\"lgmore\">读取失败</div>';}}"
+// 后台把剩下的页补齐（最多 10 页 = 300 条）：回放要完整航线，不是当前页的 30 条
+"async function lgFill(){"
+"if(lgLoading||!lgMac)return;"
+"lgLoading=true;"
+"const who=lgMac;"
+"const n=lgPageCount();"
+"lgNow();"
+"for(let p=0;p<n;p++){"
+"if(lgPages[p])continue;"
+"try{"
+"const r=await fetch('/api/log/points?limit='+LG_PER+'&offset='+(p*LG_PER)"
+"+'&mac='+encodeURIComponent(who));"
+"const j=await r.json();"
+"if(who!==lgMac)return;"
+"const a=lgRev(j.points);"
+"if(!a.length)break;"
+"lgPages[p]=a;"
+"}catch(e){break;}"
+"lgRebuildPath();lgNow();}"
+"lgLoading=false;"
+"if(who!==lgMac)return;"
+"lgPager();lgNow();lgPathDraw();}"
+"function lgRender(){"
+"const box=q('lgpoints');if(!box)return;"
+"if(!lgPts.length){box.innerHTML='<div class=\"lgmore\">'"
+"+(lgPage>0?'本页没有记录了，往回翻一页试试。':'该目标暂无记录。')+'</div>';return;}"
+"let h='<div class=\"lgpt hd\"><span>时间</span><span>纬度</span><span>经度</span><span>高度</span><span>速度</span><span>航向</span></div>';"
+"for(let i=0;i<lgPts.length;i++){const p=lgPts[i];"
+"const ts=fmtT(p.t,p.tick);"
+"const dt=p.t>0?('<b class=\"dt\">'+ts.slice(5,10)+' </b>'):'';"
+"const tm=p.t>0?ts.slice(11):ts;"
+"h+='<div class=\"lgpt\" data-i=\"'+i+'\">'"
+"+'<span class=\"mono\">'+dt+tm+'</span>'"
+"+'<span class=\"mono\" data-l=\"纬 \">'+Number(p.lat).toFixed(5)+'</span>'"
+"+'<span class=\"mono\" data-l=\"经 \">'+Number(p.lon).toFixed(5)+'</span>'"
+"+'<span data-l=\"高 \">'+Math.round(p.alt)+' m</span>'"
+"+'<span data-l=\"速 \">'+Number(p.spd_h).toFixed(1)+' m/s</span>'"
+"+'<span data-l=\"向 \">'+Math.round(p.track)+'°</span></div>';}"
+"box.innerHTML=h;}"
+"function lgPager(){"
+"const box=q('lgpage');if(!box)return;"
+"const mine=lgMatched||0;"
+"let pages=lgPageCount();"
+"if(lgPage+1>pages)pages=lgPage+1;"
+// 页码最多同时显示 5 个（手机上 12 个按钮会换行），以当前页居中
+"let from=0;"
+"if(pages>5)from=Math.min(Math.max(lgPage-2,0),pages-5);"
+"const to=Math.min(pages,from+5);"
+"let h='<button type=\"button\" data-pg=\"'+(lgPage-1)+'\"'+(lgPage<=0?' disabled':'')"
+"+'>上一页</button>';"
+"for(let i=from;i<to;i++){"
+"h+='<button type=\"button\" data-pg=\"'+i+'\"'+(i===lgPage?' class=\"on\"':'')+'>'+(i+1)+'</button>';}"
+"h+='<button type=\"button\" data-pg=\"'+(lgPage+1)+'\"'+(lgPage>=pages-1?' disabled':'')"
+"+'>下一页</button>';"
+"h+='<span class=\"info\">第 '+(lgPage+1)+' / '+pages+' 页 · 每页 '+LG_PER+' 条 · 共 '+mine+' 条'"
+"+(mine>LG_PER*LG_MAXP?('（只保留最近 '+(LG_PER*LG_MAXP)+' 条，更早的请导出 CSV）'):'')"
+"+'</span>';"
+"box.innerHTML=h;"
+"Array.prototype.forEach.call(box.querySelectorAll('button[data-pg]'),function(b){"
+"b.onclick=function(){"
+"const v=Number(b.getAttribute('data-pg'));"
+"if(!(v>=0)||v===lgPage)return;"
+"lgStop();lgPlay=-1;lgPage=v;"
+// 已经补齐的页直接用缓存，不再打一次设备
+"if(lgPages[v]){lgPts=lgPages[v];lgRender();lgPager();lgNow();lgRowMark();}"
+"else lgFetch();};});}"
+// ---- 航线回放：沿 lgPath（全部页合并，最多 300 条）走 ----
+"function lgStop(){if(lgTimer){clearInterval(lgTimer);lgTimer=null;}"
+"const b=q('lgpp');if(b)b.textContent='播放';}"
+"function lgPlayToggle(){"
+"if(lgLoading){msg('正在读取全部航线点，稍等一下',false);return;}"
+"if(lgPath.length<2){msg('这个目标只有一个点，无法回放',false);return;}"
+"if(lgTimer){lgStop();return;}"
+"if(lgPlay<0||lgPlay>=lgPath.length-1)lgPlay=0;"
+"const b=q('lgpp');if(b)b.textContent='暂停';"
+"lgSeek(lgPlay);"
+// 300 条按 420ms 一条要两分钟，点多时用更快的基准间隔
+"lgTimer=setInterval(function(){"
+"if(lgPlay>=lgPath.length-1){lgStop();lgNow();return;}"
+"lgSeek(lgPlay+1);},Math.round((lgPath.length>150?280:420)/lgRate));}"
+"function lgSeek(i){"
+"if(i<0||i>=lgPath.length)return;"
+"lgPlay=i;"
+"const p=lgPath[i];"
+// 回放到别的页时表格自动翻过去，保证高亮的那一行就是地图上的当前点
+"if(p&&p.pg!==lgPage&&lgPages[p.pg]){lgPage=p.pg;lgPts=lgPages[p.pg];lgRender();lgPager();}"
+"lgNow();lgDraw(true);lgRowMark();}"
+"function lgReset(){lgStop();lgPlay=-1;lgNow();lgDraw(true);lgRowMark();}"
+"function lgSetRate(v){lgRate=Number(v)||1;"
+"if(lgTimer){lgStop();lgPlayToggle();}}"
+"function lgNow(){"
+"const el=q('lgnow');if(!el)return;"
+"if(!lgPath.length){el.textContent='';return;}"
+"if(lgPlay<0){"
+"if(lgLoading){el.textContent='正在合并全部航线点（已 '+lgPath.length+' 条）…';return;}"
+"el.textContent='航线 '+lgPath.length+' 条'"
+"+(lgPath.length>LG_PER?('（'+lgPageCount()+' 页合并）'):'')+'，点「播放」按时间顺序回放';"
+"return;}"
+"const p=lgPath[lgPlay];"
+"el.textContent=fmtT(p.t,p.tick)+'  '+(lgPlay+1)+'/'+lgPath.length"
+"+'  高 '+Math.round(p.alt)+' m  速 '+Number(p.spd_h).toFixed(1)+' m/s  向 '"
+"+Math.round(p.track)+'°';}"
+"function lgRowMark(){"
+"const box=q('lgpoints');if(!box)return;"
+"const cur=(lgPlay>=0&&lgPath[lgPlay]&&lgPath[lgPlay].pg===lgPage)?lgPath[lgPlay].ri:-1;"
+"Array.prototype.forEach.call(box.querySelectorAll('.lgpt[data-i]'),function(r){"
+"r.className='lgpt'+(Number(r.getAttribute('data-i'))===cur?' cur':'');});}"
+// 地图交给独立模块 /rxmap.js（页内不放一行 Leaflet 代码）：能画就用地图，
+// 画不了（模块没加载、热点没网取不到 Leaflet）就退回下面的 canvas 折线图
+"function lgMapTry(){"
+"if(!lgPath.length)return false;"
+"if(!(window.RXMAP&&typeof RXMAP.replay==='function'))return false;"
+"const mb=q('lgmap');"
+"if(!mb||mb.offsetParent===null||mb.clientWidth<40)return false;"
+"try{return !!RXMAP.replay('lgmap',lgPath);}catch(e){return false;}}"
+// 航线数据变了（补页、换目标）就整条重画一次；回放中不动底图，只跟当前点
+"function lgPathDraw(){"
+"if(!lgPath.length)return;"
+"if(lgTimer){lgDraw(true);return;}"
+"if(lgHasMap){"
+"if(window.RXMAP&&RXMAP.replay){"
+"try{if(!RXMAP.replay('lgmap',lgPath))lgHasMap=false;}catch(e){lgHasMap=false;}"
+"}"
+"}else lgHasMap=lgMapTry();"
+"lgDraw(false);}"
+"function lgDraw(move){"
+"try{"
+"const cv=q('lgcv'),mb=q('lgmap');"
+"if(!mb||mb.offsetParent===null)return;"
+"if(!lgHasMap)lgHasMap=lgMapTry();"
+"if(lgHasMap){"
+"if(cv)cv.style.display='none';"
+"mb.style.display='';"
+"if(move&&window.RXMAP&&RXMAP.replayMark){"
+"try{RXMAP.replayMark(lgPlay);}catch(e){}}"
+"return;"
+"}"
+"if(cv)cv.style.display='';"
+"mb.style.display='none';"
+"lgCanvas();"
+"}catch(e){}}"
+"function lgResize(){"
+"try{if(window.RXMAP&&RXMAP.resize)RXMAP.resize();}catch(e){}"
+"if(!lgHasMap&&lgPath.length)lgHasMap=lgMapTry();"
+"lgDraw(false);}"
+"function lgCanvas(){"
+"const cv=q('lgcv');if(!cv||!lgPath.length)return;"
+"const w=Math.max(1,Math.round(cv.clientWidth||320));"
+"const h=Math.max(1,Math.round(cv.clientHeight||230));"
+"const dpr=Math.min(window.devicePixelRatio||1,2);"
+"if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){"
+"cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);}"
+"const g=cv.getContext('2d');if(!g)return;"
+"g.setTransform(dpr,0,0,dpr,0,0);"
+"g.fillStyle='#f4f7fb';g.fillRect(0,0,w,h);"
+"g.strokeStyle='#e3e9f0';g.lineWidth=1;g.beginPath();"
+"for(let x=0.5;x<w;x+=32){g.moveTo(x,0);g.lineTo(x,h);}"
+"for(let y=0.5;y<h;y+=32){g.moveTo(0,y);g.lineTo(w,y);}"
+"g.stroke();"
+"let mnla=90,mxla=-90,mnlo=180,mxlo=-180,n=0;"
+"for(let i=0;i<lgPath.length;i++){"
+"const la=Number(lgPath[i].lat),lo=Number(lgPath[i].lon);"
+"if(!isFinite(la)||!isFinite(lo)||(la===0&&lo===0))continue;"
+"n++;"
+"if(la<mnla)mnla=la;if(la>mxla)mxla=la;"
+"if(lo<mnlo)mnlo=lo;if(lo>mxlo)mxlo=lo;}"
+"g.font='12px sans-serif';g.fillStyle='#8b95a1';"
+"if(!n){g.fillText('这条航线没有有效坐标',12,24);return;}"
+"const la0=(mnla+mxla)/2,lo0=(mnlo+mxlo)/2;"
+"const kx=Math.cos(la0*Math.PI/180)||1;"
+"const sx=(mxlo-mnlo)*kx*111320,sy=(mxla-mnla)*111320;"
+"const pad=26;"
+"const sc=Math.min((w-pad*2)/Math.max(sx,1e-3),(h-pad*2)/Math.max(sy,1e-3));"
+"const S=(isFinite(sc)&&sc>0)?sc:1;"
+"function XY(la,lo){"
+"return [w/2+(lo-lo0)*kx*111320*S,h/2-(la-la0)*111320*S];}"
+"function each(f){"
+"for(let i=0;i<lgPath.length;i++){"
+"const la=Number(lgPath[i].lat),lo=Number(lgPath[i].lon);"
+"if(!isFinite(la)||!isFinite(lo)||(la===0&&lo===0))continue;"
+"f(XY(la,lo),i);}}"
+"g.strokeStyle='rgba(21,101,192,.9)';g.lineWidth=3;g.lineJoin='round';"
+"g.beginPath();let st=false;"
+"each(function(p){if(!st){g.moveTo(p[0],p[1]);st=true;}else g.lineTo(p[0],p[1]);});"
+"g.stroke();"
+"g.fillStyle='#1565c0';"
+"each(function(p){g.beginPath();g.arc(p[0],p[1],2.5,0,6.284);g.fill();});"
+"each(function(p,i){"
+"if(i!==0&&i!==lgPath.length-1)return;"
+"g.fillStyle=(i===0)?'#0f8a4d':'#c0392b';"
+"g.beginPath();g.arc(p[0],p[1],6,0,6.284);g.fill();"
+"g.strokeStyle='#fff';g.lineWidth=2;g.stroke();});"
+"if(lgPlay>=0&&lgPath[lgPlay]){"
+"const cla=Number(lgPath[lgPlay].lat),clo=Number(lgPath[lgPlay].lon);"
+"if(isFinite(cla)&&isFinite(clo)&&!(cla===0&&clo===0)){"
+"const cp=XY(cla,clo);"
+"g.fillStyle='#fff';g.strokeStyle='#1565c0';g.lineWidth=3;"
+"g.beginPath();g.arc(cp[0],cp[1],7,0,6.284);g.fill();g.stroke();}}"
+"const cand=[10,20,50,100,200,500,1000,2000,5000];"
+"let Lm=10;"
+"for(let i=0;i<cand.length;i++){if(cand[i]*S<=90)Lm=cand[i];}"
+"g.strokeStyle='#475569';g.lineWidth=2;g.beginPath();"
+"g.moveTo(12,h-14);g.lineTo(12+Lm*S,h-14);g.stroke();"
+"g.fillStyle='#475569';g.font='11px sans-serif';"
+"g.fillText(Lm>=1000?(Lm/1000+' km'):(Lm+' m'),12,h-20);"
+"g.fillText('N',w-18,20);"
+"g.beginPath();g.moveTo(w-13,26);g.lineTo(w-13,38);g.stroke();"
+"g.beginPath();g.moveTo(w-13,22);g.lineTo(w-16,30);g.lineTo(w-10,30);"
+"g.closePath();g.fillStyle='#475569';g.fill();}"
+"async function logRefresh(){"
+// 发射模式不写日志，也没有历史卡片；直接跳过，避免把隐藏状态改回可见
+"if(roleTx())return;"
+"try{const r=await fetch('/api/log/info');const j=await r.json();"
+"const b=q('logbox');"
+"if(!j.ready){if(b)b.style.display='none';return;}"
+"if(b)b.style.display='';"
+"if(q('lgcnt'))q('lgcnt').textContent=j.count;"
+"if(q('lgused'))q('lgused').textContent=fmtKB(j.used)+' / '+fmtKB(j.total);"
+"if(q('lgrange'))q('lgrange').textContent=j.count?"
+"fmtT(j.oldest_unix,j.oldest_tick)+' → '+fmtT(j.newest_unix,j.newest_tick):'暂无记录';"
+"if(q('lgfill'))q('lgfill').style.width=(j.capacity?(j.count*100/j.capacity):0).toFixed(1)+'%';"
+"if(j.en!==undefined)lgSw(j.en);"
+"logTargets(j);"
+"}catch(e){}}"
+"function logExport(){"
+"if(bleOn){msg('导出 CSV 需要连回热点（蓝牙只传查询数据）',false);return;}"
+"const a=document.createElement('a');"
+"a.href='/api/log/export'+(lgMac?('?mac='+encodeURIComponent(lgMac)):'');"
+"a.download=lgMac?('crid_track_'+String(lgMac).replace(/:/g,'')+'.csv'):'crid_tracks.csv';"
+"document.body.appendChild(a);a.click();a.remove();}"
+"async function logClear(){"
+"if(!confirm('确定清空全部历史轨迹记录？清空后无法恢复。'))return;"
+"try{var r;"
+"if(bleOn){r=await fetch('/api/log/clear');}"
+"else{r=await fetch('/api/log/clear',{method:'POST'});}"
+"const j=await r.json();"
+"if(j.ok){logClose();"
+"logRefresh();msg('历史记录已清空',true);}"
+"else{msg('清空失败: '+(j.error||'未知错误'),false);}"
+"}catch(e){msg('清空失败: '+e,false);}}"
+// 删除单个目标：只作废这台无人机的记录，其他目标不受影响。设备端用 seq 墓碑实现，
+// 不擦 flash，所以毫秒级完成，而且重启后不会复活。
+// 蓝牙模式改走 GET（桥接只转发 GET），回包字段与 POST 版完全一致。
+"async function logDel(mac){"
+"if(!confirm('删除 '+String(mac).toUpperCase()+' 的全部历史轨迹？\\n删除后该目标会从列表消失，其他目标不受影响。'))return;"
+"try{var r;"
+"if(bleOn){r=await fetch('/api/log/del?mac='+encodeURIComponent(mac));}"
+"else{r=await fetch('/api/log/del',{method:'POST',"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify({mac:mac})});}"
+"const j=await r.json();"
+"if(j.ok){if(lgMac===mac)logClose();logRefresh();msg('已删除该目标的历史记录',true);}"
+"else{msg('删除失败: '+(j.error||'未知错误'),false);}"
+"}catch(e){msg('删除失败: '+e,false);}}"
+"async function syncTime(){sT=Date.now();tNext=sT+20000;var bad='请求失败';var j=null;"
+"try{var r;"
+"if(bleOn){r=await fetch('/api/time?ms='+sT);j=await r.json();}"
+"else{r=await fetch('/api/time',{method:'POST',"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify({epoch_ms:sT})});j=await r.json();}"
+"}catch(e){bad=(e&&e.message)||'请求失败';j=null;}"
+"if(j&&j.ok){tTries=0;tNext=0;tLast=1;tStat(true,j.now);"
+"if(!tDone){tDone=true;msg('设备时间已校准：'+tClock(j.now)+'，轨迹按真实时间写入',true);}"
+"return;}"
+"if(j&&!j.ok)bad='设备拒绝了这个时间（检查手机系统时间是否准确）';"
+// 首屏那一次很容易和别的请求挤在一起失败；失败就退避重试，否则要等 10 分钟
+// 才会再发，这段时间写下的轨迹时间全是「未知」。
+"tTries++;tBad=bad;tStat(false,0);"
+"if(tTries<3){msg('授时未完成（'+bad+'），正在重试 '+tTries+'/2…',false);"
+"setTimeout(syncTime,2000*tTries);}"
+"else{tTries=0;tNext=Date.now()+60000;msg('授时失败：'+bad,false);}}"
+// ---- 蓝牙取数：手机离开热点后网页照样能读设备（Wi-Fi 腾出来给地图瓦片） ----
+// 只认 https + 支持 Web Bluetooth 的浏览器（浏览器不给 http://192.168.x.x 暴露蓝牙）
+"var BLE_SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e';"
+"var BLE_RXC='6e400002-b5a3-f393-e0a9-e50e24dcca9e';"
+"var BLE_TXC='6e400003-b5a3-f393-e0a9-e50e24dcca9e';"
+"var bleDev=null,bleRx=null,bleTx=null,bleOn=false,bleQ=Promise.resolve();"
+"var bleWait=null,bleBytes=[],bleTimer=null,bleNotifyOn=false,bleRetry=0;"
+"function bleSecure(){return location.protocol==='https:'&&!!navigator.bluetooth;}"
+"function bleUI(){var bar=q('blebar'),t=q('bletxt'),b=q('blebtn'),o=q('bleoff'),l=q('blelnk');if(!bar)return;"
+"var http=(location.protocol!=='https:'),nb=!navigator.bluetooth;"
+"bar.classList.toggle('on',bleOn);"
+"if(t)t.textContent=bleOn?'蓝牙已连接，可以关掉 Wi-Fi 用流量看地图':"
+"(http?'蓝牙取数需要 https 打开（首次会提示证书不安全，点「继续前往」）':"
+"(nb?'这个浏览器不支持网页蓝牙（iPhone 自带的 Safari 不支持）':'蓝牙未连接'));"
+"if(l)l.style.display=(!bleOn&&http)?'':'none';"
+"if(b){b.style.display=(bleOn||http||nb)?'none':'';"
+"if(!bleOn&&bleDev)b.textContent='重新连接';}"
+"if(o)o.style.display=bleOn?'':'none';}"
+"async function bleAttach(dev){"
+"if(!dev||!dev.gatt)throw new Error('设备不可用');"
+"bleDev=dev;"
+"try{dev.removeEventListener('gattserverdisconnected',bleDown);}catch(e){}"
+"dev.addEventListener('gattserverdisconnected',bleDown);"
+"const srv=await dev.gatt.connect();"
+"const svc=await srv.getPrimaryService(BLE_SVC);"
+"bleRx=await svc.getCharacteristic(BLE_RXC);"
+"bleTx=await svc.getCharacteristic(BLE_TXC);"
+"if(!bleNotifyOn){await bleTx.startNotifications();"
+"bleTx.addEventListener('characteristicvaluechanged',bleData);bleNotifyOn=true;}"
+"bleOn=true;bleRetry=0;bleUI();msg('蓝牙已连接，现在可以关闭 Wi-Fi',true);}"
+"async function bleGo(){"
+"if(location.protocol!=='https:'){location.href='https://'+location.host+'/';return;}"
+"if(!navigator.bluetooth){msg('这个浏览器不支持网页蓝牙（iPhone 自带的 Safari 不支持）',false);return;}"
+"try{"
+"if(!bleDev&&navigator.bluetooth.getDevices){"
+"try{const ds=await navigator.bluetooth.getDevices();"
+"for(let i=0;i<ds.length;i++){const n=ds[i].name||'';"
+"if(n.indexOf('ESP32-CRID')===0){bleDev=ds[i];break;}}}catch(e){}}"
+"if(!bleDev){bleDev=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'ESP32-CRID'}],"
+"optionalServices:[BLE_SVC]});}"
+"await bleAttach(bleDev);"
+"}catch(e){msg('蓝牙连接失败: '+((e&&e.message)||e),false);}}"
+"function bleDown(){bleOn=false;bleRx=null;bleTx=null;bleNotifyOn=false;bleBytes=[];bleWait=null;bleUI();"
+"if(bleDev&&bleRetry<5){bleRetry++;"
+"setTimeout(function(){if(bleOn||!bleDev)return;"
+"bleAttach(bleDev).catch(function(){});},1200);}}"
+"function bleStop(){bleRetry=9;"
+"try{if(bleDev&&bleDev.gatt.connected)bleDev.gatt.disconnect();}catch(e){}"
+"bleDown();msg('蓝牙已断开',true);}"
+// 帧解析：01 起始(4 字节长度) / 02 数据 / 03 结束 / 04 错误
+"function bleData(ev){const dv=ev.target.value,t=dv.getUint8(0);let i;"
+"if(t===1){bleBytes=[];}"
+"else if(t===2){for(i=1;i<dv.byteLength;i++)bleBytes.push(dv.getUint8(i));}"
+"else if(t===3){let txt='';try{txt=new TextDecoder('utf-8').decode(new Uint8Array(bleBytes));}"
+"catch(e){}bleBytes=[];if(bleWait){const f=bleWait;bleWait=null;f(txt);}}"
+"else if(t===4){bleBytes=[];if(bleWait){const g=bleWait;bleWait=null;g(null);}}}"
+"function bleDo(path){return new Promise(function(res,rej){"
+"if(!bleOn||!bleRx)return rej(new Error('蓝牙未连接'));"
+"bleWait=function(txt){if(txt===null)return rej(new Error('设备返回错误'));"
+"res({ok:true,json:async function(){return JSON.parse(txt);},text:async function(){return txt;}});};"
+"bleRx.writeValue(new TextEncoder().encode(path)).catch(function(e){bleWait=null;rej(e);});"
+"clearTimeout(bleTimer);"
+"bleTimer=setTimeout(function(){if(bleWait){bleWait=null;rej(new Error('蓝牙超时'));}},8000);});}"
+// 串行化：同一个连接上同时发两个请求会把响应帧搅在一起
+"function bleFetch(path){const p=bleQ.then(function(){return bleDo(path);});"
+"bleQ=p.catch(function(){});return p;}"
+"var _fetch=window.fetch?window.fetch.bind(window):null;"
+"window.fetch=function(u,o){"
+"const s=typeof u==='string'?u:((u&&u.url)||'');"
+"const m=(o&&o.method?String(o.method):'GET').toUpperCase();"
+"const isApi=s.indexOf('/api/')===0;"
+"if(bleOn&&isApi&&m!=='GET')return Promise.reject(new Error('蓝牙模式下不能改配置，请连回热点'));"
+"if(bleOn&&isApi)return bleFetch(s);"
+"return _fetch(u,o);};"
+"bleUI();"
+// 首屏原本同时发 5 个请求（config / status / time / ota / log），httpd 的客户端槽
+// 只有几个，排队等槽时浏览器容易判超时或收到连接重置——表现就是「页面参数全空」。
+// 改成串行：配置到手后再拉版本与日志统计，肉眼无差别，但不再抢槽。
+"syncTime();"
+"load().then(function(){otaLoad();logRefresh();},function(){otaLoad();logRefresh();});"
+"setInterval(poll,2000);"
+"setInterval(logRefresh,8000);"
+"</script></body></html>";
+
+// ================================================================
+// URI 处理
+// ================================================================
+
+static esp_err_t handler_page(httpd_req_t *req) {
+    // gzip 优先：页面 36KB 直传在 softAP 上偶发截断（手机端脚本解析失败导致
+    // 整页空白），压缩后仅 12KB，大幅降低传输失败概率
+    char ae[64] = {0};
+    bool gzip_ok = false;
+    if (httpd_req_get_hdr_value_str(req, "Accept-Encoding", ae, sizeof(ae)) == ESP_OK) {
+        gzip_ok = strstr(ae, "gzip") != NULL;
+    }
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    // 禁止缓存：页面随固件更新，手机连热点后必须拿到当前版本
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    if (gzip_ok) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+        return httpd_resp_send(req, (const char *)PAGE_HTML_GZ, PAGE_HTML_GZ_LEN);
+    }
+    return httpd_resp_send(req, PAGE_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+// 接收端地图脚本独立下发：与主页面分离，按需加载。加载失败只影响地图，
+// 主页面与接收列表不受任何影响（这是本次重做的核心隔离原则）。
+static esp_err_t handler_rxmapjs(httpd_req_t *req) {
+    char ae[64] = {0};
+    bool gzip_ok = false;
+    if (httpd_req_get_hdr_value_str(req, "Accept-Encoding", ae, sizeof(ae)) == ESP_OK) {
+        gzip_ok = strstr(ae, "gzip") != NULL;
+    }
+    httpd_resp_set_type(req, "application/javascript; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    if (gzip_ok) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+        return httpd_resp_send(req, (const char *)RXMAP_JS_GZ, RXMAP_JS_GZ_LEN);
+    }
+    return httpd_resp_send(req, RXMAP_JS, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t handler_get_config(httpd_req_t *req) {
+    cn_crid_config_t *cfg = s_config;
+    cJSON *j = cJSON_CreateObject();
+    if (j == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    cJSON_AddStringToObject(j, "uas_id", cfg->uas_id);
+    cJSON_AddStringToObject(j, "drone_name", cfg->drone_name);
+    cJSON_AddStringToObject(j, "operator_id", cfg->operator_id);
+    cJSON_AddStringToObject(j, "ssid", cfg->ssid);
+    // 明文回给页面：能读到它的人已经过了热点密码这一关（或是插着 USB 看串口的人）
+    cJSON_AddStringToObject(j, "ap_password", cfg->ap_password);
+    cJSON_AddNumberToObject(j, "channel", cfg->channel);
+    cJSON_AddNumberToObject(j, "beacon_interval_ms", cfg->beacon_interval_ms);
+    cJSON_AddNumberToObject(j, "ua_type", cfg->ua_type);
+    cJSON_AddNumberToObject(j, "base_latitude", cfg->base_latitude);
+    cJSON_AddNumberToObject(j, "base_longitude", cfg->base_longitude);
+    cJSON_AddNumberToObject(j, "base_altitude_msl", cfg->base_altitude_msl);
+    cJSON_AddNumberToObject(j, "ground_altitude", cfg->ground_altitude);
+    cJSON_AddNumberToObject(j, "baro_altitude", cfg->baro_altitude);
+    cJSON_AddNumberToObject(j, "altitude_wave", cfg->altitude_wave);
+    cJSON_AddNumberToObject(j, "operator_latitude", cfg->operator_lat);
+    cJSON_AddNumberToObject(j, "operator_longitude", cfg->operator_lon);
+    cJSON_AddNumberToObject(j, "operator_altitude", cfg->operator_alt);
+    cJSON_AddNumberToObject(j, "altitude_agl", cfg->altitude_agl);
+    cJSON_AddNumberToObject(j, "speed_horizontal", cfg->speed_horizontal);
+    cJSON_AddNumberToObject(j, "speed_vertical", cfg->speed_vertical);
+    cJSON_AddNumberToObject(j, "heading", cfg->heading);
+    cJSON_AddNumberToObject(j, "heading_mode", cfg->heading_mode);
+    cJSON_AddNumberToObject(j, "vspd_mode", cfg->vspd_mode);
+    cJSON_AddNumberToObject(j, "height_type", cfg->height_type);
+    cJSON_AddNumberToObject(j, "operator_location_type", cfg->operator_location_type);
+    cJSON_AddNumberToObject(j, "status", cfg->status);
+    cJSON_AddNumberToObject(j, "patrol_speed", cfg->patrol_speed);
+    cJSON_AddNumberToObject(j, "patrol_radius_lat", cfg->patrol_radius_lat);
+    cJSON_AddNumberToObject(j, "patrol_radius_lon", cfg->patrol_radius_lon);
+    cJSON_AddNumberToObject(j, "device_mode", cfg->device_mode);
+    cJSON_AddNumberToObject(j, "rid_standard", cfg->rid_standard);
+    cJSON_AddStringToObject(j, "realname_id", cfg->realname_id);
+    cJSON_AddNumberToObject(j, "ua_category_gb", cfg->ua_category_gb);
+    cJSON_AddNumberToObject(j, "band", cfg->band);
+    cJSON_AddNumberToObject(j, "tx_2g", cfg->tx_2g);
+    cJSON_AddNumberToObject(j, "rx_2g", cfg->rx_2g);
+    cJSON_AddNumberToObject(j, "tx_5g", cfg->tx_5g);
+    cJSON_AddNumberToObject(j, "rx_5g", cfg->rx_5g);
+    cJSON_AddNumberToObject(j, "channel_5g", cfg->channel_5g);
+    cJSON_AddBoolToObject(j, "has5g", CRID_HAS_5G_BAND ? true : false);
+
+    const char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, s);
+    cJSON_free((void *)s);
+    cJSON_Delete(j);
+    return ESP_OK;
+}
+
+// 从 JSON 取浮点/整数（不存在则跳过）。
+// 兼容数字与字符串两种类型：浏览器表单提交的值常为字符串（"23.14"）。
+static bool jget_num(const cJSON *j, const char *key, double *out) {
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(j, key);
+    if (it == NULL) return false;
+    if (cJSON_IsNumber(it)) {
+        *out = cJSON_GetNumberValue(it);
+        return true;
+    }
+    if (cJSON_IsString(it)) {
+        const char *s = cJSON_GetStringValue(it);
+        if (s != NULL && *s != '\0') {
+            char *end = NULL;
+            double v = strtod(s, &end);
+            if (end != s) { *out = v; return true; }
+        }
+    }
+    return false;
+}
+
+static esp_err_t handler_post_config(httpd_req_t *req) {
+    int total = req->content_len;
+    if (total <= 0 || total > 4096) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad length");
+        return ESP_FAIL;
+    }
+
+    char *body = malloc(total + 1);
+    if (body == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    int received = 0, ret;
+    while (received < total) {
+        ret = httpd_req_recv(req, body + received, total - received);
+        if (ret <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv fail"); return ESP_FAIL; }
+        received += ret;
+    }
+    body[total] = '\0';
+
+    cJSON *j = cJSON_Parse(body);
+    free(body);
+    if (j == NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_FAIL;
+    }
+
+    cn_crid_config_t *cfg = s_config;
+    cn_crid_config_t next = *cfg;       // 先在副本上校验，全部通过后才应用
+    char err[64] = {0};
+    double v;
+    bool restarted = false;
+
+    const cJSON *item;
+    if ((item = cJSON_GetObjectItemCaseSensitive(j, "uas_id")) != NULL && cJSON_IsString(item)) {
+        strncpy(next.uas_id, cJSON_GetStringValue(item), CRID_UAS_ID_MAX_LEN);
+        next.uas_id[CRID_UAS_ID_MAX_LEN] = '\0';
+    }
+    if ((item = cJSON_GetObjectItemCaseSensitive(j, "drone_name")) != NULL && cJSON_IsString(item)) {
+        strncpy(next.drone_name, cJSON_GetStringValue(item), CRID_UAS_ID_MAX_LEN);
+        next.drone_name[CRID_UAS_ID_MAX_LEN] = '\0';
+    }
+    if ((item = cJSON_GetObjectItemCaseSensitive(j, "operator_id")) != NULL && cJSON_IsString(item)) {
+        strncpy(next.operator_id, cJSON_GetStringValue(item), CRID_UAS_ID_MAX_LEN);
+        next.operator_id[CRID_UAS_ID_MAX_LEN] = '\0';
+    }
+    if ((item = cJSON_GetObjectItemCaseSensitive(j, "ssid")) != NULL && cJSON_IsString(item)) {
+        const char *s = cJSON_GetStringValue(item);
+        if (strlen(s) == 0) snprintf(err, sizeof(err), "SSID 不能为空");
+        else { strncpy(next.ssid, s, CRID_SSID_MAX_LEN); next.ssid[CRID_SSID_MAX_LEN] = '\0'; }
+    }
+    if (err[0] == '\0' && (item = cJSON_GetObjectItemCaseSensitive(j, "ap_password")) != NULL &&
+        cJSON_IsString(item)) {
+        // 空串是合法值：用户明确要求「开放热点」（不加密），页面会给出警告
+        const char *s = cJSON_GetStringValue(item);
+        size_t n = strlen(s);
+        if (n == 0) {
+            next.ap_password[0] = '\0';
+        } else if (n < CRID_AP_PASS_MIN_LEN) {
+            snprintf(err, sizeof(err), "热点密码至少 8 位");
+        } else if (n > CRID_AP_PASS_MAX_LEN) {
+            snprintf(err, sizeof(err), "热点密码最多 63 位");
+        } else {
+            bool printable = true;
+            for (size_t i = 0; i < n; i++) {
+                unsigned char c = (unsigned char)s[i];
+                if (c < 0x20 || c > 0x7E) { printable = false; break; }
+            }
+            if (!printable) snprintf(err, sizeof(err), "热点密码只能用可见键盘字符");
+            else memcpy(next.ap_password, s, n + 1);
+        }
+    }
+    if (err[0] == '\0' && jget_num(j, "channel", &v)) {
+        if (v >= 1 && v <= 13) next.channel = (uint8_t)v;
+        // 兼容：老页面把 5.8G 信道塞在 channel 里，这里转存到独立字段
+        else if (v >= CRID_5G_CH_MIN && v <= CRID_5G_CH_MAX) {
+            if (((int)v - CRID_5G_CH_MIN) % CRID_5G_CH_STEP != 0)
+                snprintf(err, sizeof(err), "5.8G 信道须为 149/153/157/161/165");
+            else next.channel_5g = (uint8_t)v;
+        } else snprintf(err, sizeof(err), "信道须在 1-13（2.4G）或 149-165（5.8G）");
+    }
+    if (err[0] == '\0' && jget_num(j, "beacon_interval_ms", &v)) {
+        if (v < 200 || v > 60000) snprintf(err, sizeof(err), "广播间隔须在 200-60000ms");
+        else next.beacon_interval_ms = (uint16_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "ua_type", &v)) {
+        if (v < 0 || v > 15) snprintf(err, sizeof(err), "机型代码须在 0-15");
+        else next.ua_type = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "base_latitude", &v)) {
+        if (v < -90 || v > 90) snprintf(err, sizeof(err), "纬度须在 -90~90");
+        else next.base_latitude = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "base_longitude", &v)) {
+        if (v < -180 || v > 180) snprintf(err, sizeof(err), "经度须在 -180~180");
+        else next.base_longitude = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "operator_latitude", &v)) {
+        if (v < -90 || v > 90) snprintf(err, sizeof(err), "飞手纬度须在 -90~90");
+        else next.operator_lat = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "operator_longitude", &v)) {
+        if (v < -180 || v > 180) snprintf(err, sizeof(err), "飞手经度须在 -180~180");
+        else next.operator_lon = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "operator_altitude", &v)) {
+        if (v < -1000 || v > 10000) snprintf(err, sizeof(err), "飞手海拔须在 -1000~10000m");
+        else next.operator_alt = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "base_altitude_msl", &v)) next.base_altitude_msl = (float)v;
+    if (err[0] == '\0' && jget_num(j, "ground_altitude", &v)) {
+        if (v < -1000 || v > 10000) snprintf(err, sizeof(err), "地面海拔须在 -1000~10000m");
+        else next.ground_altitude = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "altitude_agl", &v)) next.altitude_agl = (float)v;
+    if (err[0] == '\0' && jget_num(j, "altitude_wave", &v)) {
+        if (v < 0 || v > 100) snprintf(err, sizeof(err), "高度波动幅度须在 0~100m");
+        else next.altitude_wave = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "speed_horizontal", &v)) {
+        if (v < 0 || v > 254) snprintf(err, sizeof(err), "速度须在 0~254 m/s");
+        else next.speed_horizontal = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "baro_altitude", &v)) {
+        if (v < -1000 || v > 20000) snprintf(err, sizeof(err), "气压高度须在 -1000~20000m");
+        else next.baro_altitude = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "heading", &v)) {
+        // 359.9 也允许（编码时 0.1° 步进会落到 3599），360 视为 0 不方便，直接拒绝
+        if (v < 0 || v > 359.9) snprintf(err, sizeof(err), "航向须在 0~359.9°");
+        else next.heading = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "heading_mode", &v)) {
+        if (v < 0 || v > 1) snprintf(err, sizeof(err), "航向来源取值 0-1");
+        else next.heading_mode = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "speed_vertical", &v)) {
+        if (v < -62 || v > 62) snprintf(err, sizeof(err), "垂直速度须在 -62~62 m/s");
+        else next.speed_vertical = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "vspd_mode", &v)) {
+        if (v < 0 || v > 1) snprintf(err, sizeof(err), "垂直速度来源取值 0-1");
+        else next.vspd_mode = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "height_type", &v)) {
+        if (v < 0 || v > 1) snprintf(err, sizeof(err), "高度基准取值 0-1");
+        else next.height_type = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "operator_location_type", &v)) {
+        if (v < 0 || v > 2) snprintf(err, sizeof(err), "遥控站位置类型取值 0-2");
+        else next.operator_location_type = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "status", &v)) {
+        if (v < 0 || v > 4) snprintf(err, sizeof(err), "状态取值 0-4");
+        else next.status = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "patrol_speed", &v)) {
+        if (v < 0 || v > 10) snprintf(err, sizeof(err), "巡游速度系数须在 0~10");
+        else next.patrol_speed = (float)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "patrol_radius_lat", &v)) next.patrol_radius_lat = (float)v;
+    if (err[0] == '\0' && jget_num(j, "patrol_radius_lon", &v)) next.patrol_radius_lon = (float)v;
+    // 频段与收发开关。老页面只传 device_mode，这里做兼容映射到 2.4G 组。
+    bool has_switch_fields = (cJSON_GetObjectItemCaseSensitive(j, "band") != NULL);
+    if (err[0] == '\0' && has_switch_fields) {
+        if (jget_num(j, "band", &v)) {
+            if (v < 0 || v > 1) snprintf(err, sizeof(err), "频段取值 0-1");
+            else next.band = (uint8_t)v;
+        }
+        if (jget_num(j, "tx_2g", &v)) next.tx_2g = v ? 1 : 0;
+        if (jget_num(j, "rx_2g", &v)) next.rx_2g = v ? 1 : 0;
+        if (jget_num(j, "tx_5g", &v)) next.tx_5g = v ? 1 : 0;
+        if (jget_num(j, "rx_5g", &v)) next.rx_5g = v ? 1 : 0;
+        if (jget_num(j, "channel_5g", &v)) {
+            if (v < CRID_5G_CH_MIN || v > CRID_5G_CH_MAX ||
+                ((int)v - CRID_5G_CH_MIN) % CRID_5G_CH_STEP != 0) {
+                snprintf(err, sizeof(err), "5.8G 信道须为 149/153/157/161/165");
+            } else {
+                next.channel_5g = (uint8_t)v;
+            }
+        }
+#if !CRID_HAS_5G_BAND
+        // 无 5G 射频的芯片：无论页面传什么都强制回落 2.4G
+        if (next.band == CRID_BAND_5G) next.band = CRID_BAND_2G;
+#endif
+        // 单射频互斥：老页面或手工请求若把发射与接收都置 1，这里归一化成二选一
+        crid_config_radio_mutex(&next);
+    } else if (err[0] == '\0' && jget_num(j, "device_mode", &v)) {
+        if (v < 0 || v > 1) snprintf(err, sizeof(err), "模式取值 0-1");
+        else {
+            next.device_mode = (uint8_t)v;
+            next.band = CRID_BAND_2G;
+            next.tx_2g = (v == DEVICE_MODE_TX) ? 1 : 0;
+            next.rx_2g = (v == DEVICE_MODE_RX) ? 1 : 0;
+        }
+    }
+    if (err[0] == '\0' && jget_num(j, "rid_standard", &v)) {
+        if (v < 0 || v > 1) snprintf(err, sizeof(err), "标准取值 0-1");
+        else next.rid_standard = (uint8_t)v;
+    }
+    if (err[0] == '\0' && jget_num(j, "ua_category_gb", &v)) {
+        if (v < 0 || v > 4) snprintf(err, sizeof(err), "新国标分类取值 0-4");
+        else next.ua_category_gb = (uint8_t)v;
+    }
+    if ((item = cJSON_GetObjectItemCaseSensitive(j, "realname_id")) != NULL && cJSON_IsString(item)) {
+        // 仅允许数字与大写字母（实名登记号后 8 位格式），空 = 不填
+        const char *s = cJSON_GetStringValue(item);
+        size_t n = strlen(s);
+        if (n > 8) { snprintf(err, sizeof(err), "实名登记号最多 8 位"); }
+        else {
+            for (size_t i = 0; i < n; i++) {
+                char c = s[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
+                    snprintf(err, sizeof(err), "实名登记号仅限字母数字");
+                    break;
+                }
+            }
+            if (err[0] == '\0') {
+                memset(next.realname_id, 0, sizeof(next.realname_id));
+                for (size_t i = 0; i < n; i++) {
+                    next.realname_id[i] = (s[i] >= 'a' && s[i] <= 'z') ? (char)(s[i] - 32) : s[i];
+                }
+            }
+        }
+    }
+    cJSON_Delete(j);
+
+    if (err[0] != '\0') {
+        httpd_resp_set_type(req, "application/json");
+        char resp[96];
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"err\":\"%s\"}", err);
+        httpd_resp_sendstr(req, resp);
+        return ESP_OK;
+    }
+
+    // 校验通过，应用配置
+    uint8_t old_ch = crid_band_channel(cfg);
+    uint8_t new_ch = crid_band_channel(&next);
+    bool band_changed = (next.band != cfg->band);
+    bool ap_changed = (strcmp(next.ssid, cfg->ssid) != 0) ||
+                      (strcmp(next.ap_password, cfg->ap_password) != 0) ||
+                      (new_ch != old_ch) ||
+                      (next.beacon_interval_ms != cfg->beacon_interval_ms) ||
+                      band_changed;
+    bool mode_changed = (next.device_mode != cfg->device_mode) ||
+                        (next.tx_2g != cfg->tx_2g) || (next.rx_2g != cfg->rx_2g) ||
+                        (next.tx_5g != cfg->tx_5g) || (next.rx_5g != cfg->rx_5g);
+    uint8_t saved_counter = cfg->message_counter;   // 计数器不回退
+    *cfg = next;
+    cfg->message_counter = saved_counter;
+    // 同步当前显示位置
+    cfg->latitude = cfg->base_latitude;
+    cfg->longitude = cfg->base_longitude;
+    cfg->altitude_msl = cfg->base_altitude_msl;
+    // 相对高度以「海拔 - 地面海拔」为准，页面传来的 AGL 只作参考（防止两者打架）
+    cfg->altitude_agl = cfg->altitude_msl - cfg->ground_altitude;
+
+    restarted = ap_changed;
+
+    crid_config_save_nvs(cfg);
+    ESP_LOGI(TAG, "Config updated via web: id=%s pos=(%.6f,%.6f) mode=%u std=%u restarted=%d",
+             cfg->uas_id, cfg->base_latitude, cfg->base_longitude,
+             cfg->device_mode, cfg->rid_standard, restarted);
+
+    // 先回包，再动热点。改 SSID / 信道 / 广播间隔会让 Wi-Fi 驱动重建 softAP，
+    // 已关联的客户端（就是正在提交表单的这个浏览器）会被踢下线；若在回包前应用，
+    // 浏览器拿不到响应，fetch 直接抛 TypeError: Failed to fetch，页面误报"保存失败"。
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, restarted ? "{\"ok\":true,\"restarted\":true}"
+                                      : "{\"ok\":true,\"restarted\":false}");
+
+    if (!ap_changed && !mode_changed) {
+        return ESP_OK;
+    }
+
+    // 给 TCP 栈留出把响应真正发出去的时间，再改热点参数
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    // 接收开启时，换信道/换频段必须先停监听，否则 set_channel 会被正在跑的
+    // 混杂接收顶着，新信道不生效
+    if (ap_changed && crid_band_rx_enabled(cfg)) {
+        crid_rx_stop();
+    }
+
+    if (ap_changed) {
+        esp_err_t ur;
+        if (band_changed) {
+            // 单射频：切频段会重建 AP，手机上必然掉线
+            ur = crid_wifi_switch_band(cfg->band, cfg->ssid, cfg->ap_password,
+                                       crid_band_channel(cfg), cfg->beacon_interval_ms);
+            ESP_LOGW(TAG, "频段切换 -> %s, channel=%u",
+                     cfg->band == CRID_BAND_5G ? "5.8G" : "2.4G", crid_band_channel(cfg));
+        } else {
+            ur = crid_wifi_update_ap(cfg->ssid, cfg->ap_password,
+                                     crid_band_channel(cfg), cfg->beacon_interval_ms);
+        }
+        if (ur != ESP_OK) {
+            ESP_LOGE(TAG, "apply AP failed: %s", esp_err_to_name(ur));
+        }
+    }
+
+    // 统一按开关重建：发射 IE / 接收监听各自独立
+    crid_app_apply_mode();
+    return ESP_OK;
+}
+
+// 接收监测列表（网页接收模式 2 秒轮询）
+static esp_err_t handler_rx(httpd_req_t *req) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "tracks");
+    cJSON *st = cJSON_AddObjectToObject(j, "stats");
+    if (j == NULL || arr == NULL || st == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+
+    crid_rx_track_t tracks[CRID_RX_MAX_TRACKS];
+    int n = crid_rx_get_tracks(tracks);
+    for (int i = 0; i < n; i++) {
+        cJSON *t = cJSON_CreateObject();
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 tracks[i].mac[0], tracks[i].mac[1], tracks[i].mac[2],
+                 tracks[i].mac[3], tracks[i].mac[4], tracks[i].mac[5]);
+        cJSON_AddStringToObject(t, "mac", mac);
+        cJSON_AddBoolToObject(t, "active", tracks[i].active);
+        cJSON_AddNumberToObject(t, "rssi", tracks[i].rssi);
+        cJSON_AddNumberToObject(t, "channel", tracks[i].channel);
+        cJSON_AddNumberToObject(t, "protocol", tracks[i].protocol);
+        cJSON_AddStringToObject(t, "uas_id", tracks[i].uas_id);
+        cJSON_AddStringToObject(t, "drone_name", tracks[i].drone_name);
+        cJSON_AddStringToObject(t, "operator_id", tracks[i].operator_id);
+        cJSON_AddStringToObject(t, "realname_id", tracks[i].realname_id);
+        cJSON_AddNumberToObject(t, "ua_type", tracks[i].ua_type);
+        cJSON_AddNumberToObject(t, "latitude", tracks[i].latitude);
+        cJSON_AddNumberToObject(t, "longitude", tracks[i].longitude);
+        cJSON_AddNumberToObject(t, "altitude_geo", tracks[i].altitude_geo);
+        cJSON_AddNumberToObject(t, "speed_horizontal", tracks[i].speed_horizontal);
+        cJSON_AddNumberToObject(t, "speed_vertical", tracks[i].speed_vertical);
+        cJSON_AddNumberToObject(t, "direction", tracks[i].direction);
+        cJSON_AddNumberToObject(t, "status", tracks[i].status);
+        cJSON_AddBoolToObject(t, "has_op_loc", tracks[i].has_op_loc);
+        cJSON_AddNumberToObject(t, "op_latitude", tracks[i].op_latitude);
+        cJSON_AddNumberToObject(t, "op_longitude", tracks[i].op_longitude);
+        cJSON_AddNumberToObject(t, "op_altitude_geo", tracks[i].op_altitude_geo);
+        cJSON_AddNumberToObject(t, "msg_count", tracks[i].msg_count);
+        cJSON_AddNumberToObject(t, "age_ms", esp_log_timestamp() - tracks[i].last_seen_ms);
+        cJSON_AddNumberToObject(t, "first_age_ms",
+                                esp_log_timestamp() - tracks[i].first_seen_ms);
+        // 补全的报文数据项
+        if (tracks[i].uas_id2[0])
+            cJSON_AddStringToObject(t, "uas_id2", tracks[i].uas_id2);
+        if (tracks[i].has_agl)
+            cJSON_AddNumberToObject(t, "altitude_agl", tracks[i].altitude_agl);
+        if (tracks[i].has_baro)
+            cJSON_AddNumberToObject(t, "altitude_baro", tracks[i].altitude_baro);
+        if (tracks[i].has_agl)
+            cJSON_AddNumberToObject(t, "agl_type", tracks[i].agl_type);
+        if (tracks[i].has_op_loc_type)
+            cJSON_AddNumberToObject(t, "op_loc_type", tracks[i].op_loc_type);
+        if (tracks[i].has_coord)
+            cJSON_AddNumberToObject(t, "coord_sys", tracks[i].coord_sys);
+        if (tracks[i].has_acc) {
+            cJSON_AddNumberToObject(t, "h_acc", tracks[i].h_acc);
+            cJSON_AddNumberToObject(t, "v_acc", tracks[i].v_acc);
+            cJSON_AddNumberToObject(t, "spd_acc", tracks[i].spd_acc);
+        }
+        if (tracks[i].has_ts) {
+            cJSON_AddNumberToObject(t, "ts_unix_ms", (double)tracks[i].ts_unix_ms);
+            cJSON_AddNumberToObject(t, "ts_acc", tracks[i].ts_acc);
+        }
+        if (tracks[i].has_ts_rel)
+            cJSON_AddNumberToObject(t, "ts_rel_10s", tracks[i].ts_rel_10s);
+        cJSON_AddItemToArray(arr, t);
+    }
+
+    uint32_t total, rid, ok, ovf;
+    crid_rx_get_stats(&total, &rid, &ok, &ovf);
+    cJSON_AddNumberToObject(st, "total", total);
+    cJSON_AddNumberToObject(st, "rid", rid);
+    cJSON_AddNumberToObject(st, "ok", ok);
+    cJSON_AddNumberToObject(st, "ovf", ovf);
+
+    const char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, s);
+    cJSON_free((void *)s);
+    cJSON_Delete(j);
+    return ESP_OK;
+}
+
+/* ================================================================
+ * 历史轨迹：接收端持久化日志的查询、导出与清空
+ * ================================================================ */
+
+// 解析 "AA:BB:CC:DD:EE:FF" / "AA-BB-..." / 12 位纯十六进制
+static bool log_parse_mac(const char *s, uint8_t mac[6]) {
+    if (s == NULL) return false;
+    int n = 0, nib = 0;
+    unsigned v = 0;
+    for (const char *p = s; *p != '\0' && n < 6; p++) {
+        char c = *p;
+        if (c == ':' || c == '-' || c == '.' || c == ' ') continue;
+        int d;
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | (unsigned)d;
+        if (++nib == 2) {
+            mac[n++] = (uint8_t)v;
+            v = 0;
+            nib = 0;
+        }
+    }
+    return n == 6;
+}
+
+/**
+ * @brief 从 query 里取 mac 并做百分号解码
+ *
+ * IDF 的 httpd_query_key_value 明确不解码（见 esp_http_server.h 注释），而浏览器侧的
+ * encodeURIComponent 会把冒号变成 %3A，直接交给 log_parse_mac 会在 '%' 处失败、
+ * 悄悄退化成「不过滤」，于是网页选某个目标却看到所有目标的点、导出也变成全量。
+ * 这里只处理 %XX（MAC 用不到 '+' 表示空格的那套语义）。
+ */
+static bool query_mac(httpd_req_t *req, uint8_t mac[6]) {
+    char qs[128], v[48], dec[48];
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) != ESP_OK) return false;
+    if (httpd_query_key_value(qs, "mac", v, sizeof(v)) != ESP_OK) return false;
+
+    size_t o = 0;
+    for (size_t i = 0; v[i] != '\0' && o < sizeof(dec) - 1; i++) {
+        char c = v[i];
+        if (c == '%') {
+            int hi = -1, lo = -1;
+            char a = v[i + 1], b = v[i + 2];
+            if (a >= '0' && a <= '9')      hi = a - '0';
+            else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10;
+            else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
+            if (b >= '0' && b <= '9')      lo = b - '0';
+            else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10;
+            else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
+            if (hi >= 0 && lo >= 0) {
+                dec[o++] = (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+            return false;               // 残缺的转义序列，当非法处理
+        }
+        dec[o++] = c;
+    }
+    dec[o] = '\0';
+    return log_parse_mac(dec, mac);
+}
+
+#define LOG_POINTS_MAX 120   // 单次最多返回条数：再多 cJSON 树会把堆吃穿
+
+static esp_err_t handler_log_info(httpd_req_t *req) {
+    crid_log_stats_t st;
+    crid_log_get_stats(&st);
+
+    cJSON *j = cJSON_CreateObject();
+    if (j == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+
+    cJSON_AddBoolToObject(j, "ready", st.ready);
+    cJSON_AddBoolToObject(j, "en", st.enabled);
+    cJSON_AddNumberToObject(j, "count", st.count);
+    cJSON_AddNumberToObject(j, "capacity", st.capacity);
+    cJSON_AddNumberToObject(j, "used", st.used_bytes);
+    cJSON_AddNumberToObject(j, "total", st.total_bytes);
+    cJSON_AddNumberToObject(j, "dropped", st.dropped);
+    cJSON_AddNumberToObject(j, "oldest_unix", st.oldest_unix);
+    cJSON_AddNumberToObject(j, "oldest_tick", st.oldest_tick);
+    cJSON_AddNumberToObject(j, "newest_unix", st.newest_unix);
+    cJSON_AddNumberToObject(j, "newest_tick", st.newest_tick);
+
+    cJSON *arr = cJSON_AddArrayToObject(j, "targets");
+    crid_log_target_t tg[16];
+    int n = crid_log_targets(tg, 16);
+    for (int i = 0; arr != NULL && i < n; i++) {
+        cJSON *t = cJSON_CreateObject();
+        if (t == NULL) break;
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 tg[i].mac[0], tg[i].mac[1], tg[i].mac[2],
+                 tg[i].mac[3], tg[i].mac[4], tg[i].mac[5]);
+        cJSON_AddStringToObject(t, "mac", mac);
+        cJSON_AddStringToObject(t, "uid", tg[i].uid);
+        cJSON_AddNumberToObject(t, "count", tg[i].count);
+        cJSON_AddNumberToObject(t, "oldest_unix", tg[i].oldest_unix);
+        cJSON_AddNumberToObject(t, "newest_unix", tg[i].newest_unix);
+        cJSON_AddNumberToObject(t, "newest_tick", tg[i].newest_tick);
+        cJSON_AddNumberToObject(t, "lat", (double)tg[i].last_lat_e7 / 1e7);
+        cJSON_AddNumberToObject(t, "lon", (double)tg[i].last_lon_e7 / 1e7);
+        cJSON_AddNumberToObject(t, "alt", tg[i].last_alt_m);
+        cJSON_AddItemToArray(arr, t);
+    }
+
+    char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (s != NULL) {
+        httpd_resp_sendstr(req, s);
+        cJSON_free(s);
+    } else {
+        httpd_resp_sendstr(req, "{\"ready\":false}");
+    }
+    cJSON_Delete(j);
+    return ESP_OK;
+}
+
+static esp_err_t handler_log_points(httpd_req_t *req) {
+    char qs[128];
+    char mac_s[24] = { 0 };
+    uint32_t limit = LOG_POINTS_MAX;
+    // 分页偏移：网页每页 30 条，最多翻 10 页，所以实际最大 270；上限留点余量
+    uint32_t offset = 0;
+
+    uint8_t mac[6] = { 0 };
+    bool filter = query_mac(req, mac);      // 自带百分号解码，见 query_mac 注释
+    if (filter) {
+        snprintf(mac_s, sizeof(mac_s), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK) {
+        char v[24];
+        if (httpd_query_key_value(qs, "limit", v, sizeof(v)) == ESP_OK) {
+            int t = atoi(v);
+            if (t > 0 && (uint32_t)t < limit) limit = (uint32_t)t;
+        }
+        if (httpd_query_key_value(qs, "offset", v, sizeof(v)) == ESP_OK) {
+            int t = atoi(v);
+            if (t > 0 && t <= 3000) offset = (uint32_t)t;
+        }
+    }
+
+    crid_log_rec_t *pts = (crid_log_rec_t *)calloc(limit, sizeof(crid_log_rec_t));
+    if (pts == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    // matched 用于算总页数；带 mac 过滤时它才是这个目标的条数（st.count 是全部目标合计）
+    uint32_t matched = 0;
+    int n = crid_log_points(filter ? mac : NULL, offset, limit, pts, 6000, &matched);
+
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "points");
+    if (j == NULL || arr == NULL) {
+        free(pts);
+        if (j) cJSON_Delete(j);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    crid_log_stats_t st;
+    crid_log_get_stats(&st);
+    cJSON_AddNumberToObject(j, "total", st.count);
+    cJSON_AddNumberToObject(j, "matched", matched);
+    cJSON_AddNumberToObject(j, "offset", offset);
+    cJSON_AddNumberToObject(j, "limit", limit);
+    cJSON_AddStringToObject(j, "mac", mac_s);
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        if (o == NULL) break;
+        cJSON_AddNumberToObject(o, "seq", pts[i].seq);
+        cJSON_AddNumberToObject(o, "t", pts[i].t_unix);
+        cJSON_AddNumberToObject(o, "tick", pts[i].tick_ms);
+        cJSON_AddNumberToObject(o, "lat", (double)pts[i].lat_e7 / 1e7);
+        cJSON_AddNumberToObject(o, "lon", (double)pts[i].lon_e7 / 1e7);
+        cJSON_AddNumberToObject(o, "alt", pts[i].alt_m);
+        if (pts[i].flags & CRID_LOG_F_AGL)
+            cJSON_AddNumberToObject(o, "agl", pts[i].agl_m);
+        cJSON_AddNumberToObject(o, "spd_h", (double)pts[i].spd_h_dms / 10.0);
+        cJSON_AddNumberToObject(o, "spd_v", (double)pts[i].spd_v_dms / 10.0);
+        cJSON_AddNumberToObject(o, "track", (double)pts[i].trk_ddeg / 10.0);
+        cJSON_AddNumberToObject(o, "ua", pts[i].ua_type);
+        cJSON_AddNumberToObject(o, "status", pts[i].status);
+        cJSON_AddNumberToObject(o, "proto", pts[i].proto);
+        cJSON_AddNumberToObject(o, "rssi", pts[i].rssi);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(pts);
+
+    char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (s != NULL) {
+        httpd_resp_sendstr(req, s);
+        cJSON_free(s);
+    } else {
+        httpd_resp_sendstr(req, "{\"points\":[]}");
+    }
+    cJSON_Delete(j);
+    return ESP_OK;
+}
+
+typedef struct {
+    httpd_req_t *req;
+    bool         has_mac;
+    uint8_t      mac[6];
+} log_csv_ctx_t;
+
+// 定点整数拆成 "整数.小数" 字符串：避免在固件里用 %f（会拉进整套浮点格式化）
+static void fmt_fixed(char *out, size_t n, long v, int digits) {
+    const char *sign = (v < 0) ? "-" : "";
+    unsigned long av = (unsigned long)(v < 0 ? -v : v);
+    if (digits == 7) {   // 经纬度：1e-7 度
+        snprintf(out, n, "%s%lu.%07lu", sign, av / 10000000UL, av % 10000000UL);
+    } else {             // 速度 / 航向：0.1 单位
+        snprintf(out, n, "%s%lu.%01lu", sign, av / 10UL, av % 10UL);
+    }
+}
+
+// UAS ID 是从报文里整段拷出来的 20 字节，可能是空格填充，也可能带控制字符。
+// 原样写进 CSV 会让整行被拆断（0x0A/0x0D）或列错位（逗号、双引号），在 Excel /
+// WPS 里看起来就是「换行没对齐」。这里只保留可见 ASCII，逗号和引号换成下划线。
+static void csv_safe(char *out, size_t n, const char *in) {
+    size_t k = 0;
+    for (size_t i = 0; in[i] != '\0' && k + 1 < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c < 0x20 || c > 0x7E) continue;     // 控制字符与非 ASCII 直接丢弃
+        out[k++] = (c == ',' || c == '"') ? '_' : (char)c;
+    }
+    out[k] = '\0';
+}
+
+static bool log_csv_row(const crid_log_rec_t *r, void *vctx) {
+    log_csv_ctx_t *c = (log_csv_ctx_t *)vctx;
+    if (c->has_mac && memcmp(r->mac, c->mac, 6) != 0) return true;
+
+    char lat[20], lon[20], sh[16], sv[16], trk[16], uid[16];
+    csv_safe(uid, sizeof(uid), r->uid);
+    fmt_fixed(lat, sizeof(lat), r->lat_e7, 7);
+    fmt_fixed(lon, sizeof(lon), r->lon_e7, 7);
+    fmt_fixed(sh, sizeof(sh), r->spd_h_dms, 1);
+    fmt_fixed(sv, sizeof(sv), r->spd_v_dms, 1);
+    fmt_fixed(trk, sizeof(trk), r->trk_ddeg, 1);
+
+    char line[192];
+    int n = snprintf(line, sizeof(line),
+                     "%lu,%lu,%02X:%02X:%02X:%02X:%02X:%02X,%s,%s,%s,%d,%d,%s,%s,%s,%u,%u,%u,%d\r\n",
+                     (unsigned long)r->t_unix, (unsigned long)r->tick_ms,
+                     r->mac[0], r->mac[1], r->mac[2], r->mac[3], r->mac[4], r->mac[5],
+                     uid, lat, lon,
+                     (int)r->alt_m,
+                     (r->flags & CRID_LOG_F_AGL) ? (int)r->agl_m : 0,
+                     sh, sv, trk,
+                     (unsigned)r->ua_type, (unsigned)r->status,
+                     (unsigned)r->proto, (int)r->rssi);
+    if (n <= 0) return true;
+    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+    return httpd_resp_send_chunk(c->req, line, (size_t)n) == ESP_OK;
+}
+
+static esp_err_t handler_log_export(httpd_req_t *req) {
+    log_csv_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.req = req;
+    ctx.has_mac = query_mac(req, ctx.mac);     // 解码后再比对，见 query_mac 注释
+
+    httpd_resp_set_type(req, "text/csv; charset=utf-8");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"crid_tracks.csv\"");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    const char *hdr =
+        "unix_time,uptime_ms,mac,uas_id,lat,lon,alt_m,agl_m,spd_h_mps,spd_v_mps,track_deg,ua_type,status,proto,rssi\r\n";
+    if (httpd_resp_send_chunk(req, hdr, strlen(hdr)) != ESP_OK) return ESP_FAIL;
+
+    crid_log_foreach(log_csv_row, &ctx);
+    httpd_resp_send_chunk(req, NULL, 0);   // 结束分块传输
+    return ESP_OK;
+}
+
+/** 清空全部轨迹：不读请求体，POST 与 GET 两个入口挂的是同一个函数 */
+static esp_err_t handler_log_clear(httpd_req_t *req) {
+    esp_err_t e = crid_log_clear();
+
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", e == ESP_OK);
+    if (e != ESP_OK) cJSON_AddStringToObject(j, "error", esp_err_to_name(e));
+
+    char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (s != NULL) {
+        httpd_resp_sendstr(req, s);
+        cJSON_free(s);
+    } else {
+        httpd_resp_sendstr(req, "{\"ok\":false}");
+    }
+    cJSON_Delete(j);
+    return ESP_OK;
+}
+
+// 删除单个目标的历史记录：{mac:"44:BD:8D:69:06:31"}
+// 「清空记录」是整片作废，而列表里往往是好几台无人机，只想删掉其中一台时用它。
+/** 删除结果回包：POST 与 GET 两个入口共用 */
+static void log_del_reply(httpd_req_t *req, bool ok, const uint8_t mac[6]) {
+    esp_err_t e = ok ? crid_log_delete_target(mac) : ESP_ERR_INVALID_ARG;
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", e == ESP_OK);
+    if (e != ESP_OK) cJSON_AddStringToObject(o, "error", esp_err_to_name(e));
+
+    char *s = cJSON_PrintUnformatted(o);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (s != NULL) {
+        httpd_resp_sendstr(req, s);
+        cJSON_free(s);
+    } else {
+        httpd_resp_sendstr(req, e == ESP_OK ? "{\"ok\":true}" : "{\"ok\":false}");
+    }
+    cJSON_Delete(o);
+}
+
+static esp_err_t handler_log_del(httpd_req_t *req) {
+    char buf[96];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    uint8_t mac[6] = { 0 };
+    bool ok = false;
+    cJSON *j = cJSON_Parse(buf);
+    if (j != NULL) {
+        cJSON *it = cJSON_GetObjectItem(j, "mac");
+        if (cJSON_IsString(it) && it->valuestring != NULL) ok = log_parse_mac(it->valuestring, mac);
+        cJSON_Delete(j);
+    }
+
+    log_del_reply(req, ok, mac);
+    return ESP_OK;
+}
+
+/**
+ * GET /api/log/del?mac=… —— 蓝牙桥接只转发 GET，没有这个变体时手机 App 只能连热点删。
+ * 与 /api/time?ms=、/api/log/enable?on= 同一套做法：有副作用的操作也开一个 GET 入口，
+ * 让 BLE 通道能覆盖全部写操作。回包字段与 POST 版完全一致，客户端不用分支解析。
+ */
+static esp_err_t handler_log_del_get(httpd_req_t *req) {
+    uint8_t mac[6] = { 0 };
+    bool ok = query_mac(req, mac);
+    log_del_reply(req, ok, mac);
+    return ESP_OK;
+}
+
+// 记录开关：{on:0|1}。状态落在 NVS（crid_log 模块负责），上电沿用上次设置，
+// 出厂无记录时为关闭。授时不会自动改这个开关。
+static void log_enable_reply(httpd_req_t *req, bool on) {
+    crid_log_set_enabled(on);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, on ? "{\"ok\":true,\"on\":true}"
+                               : "{\"ok\":true,\"on\":false}");
+}
+
+static esp_err_t handler_log_enable(httpd_req_t *req) {
+    char buf[64];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    bool on = false;
+    cJSON *j = cJSON_Parse(buf);
+    if (j != NULL) {
+        cJSON *it = cJSON_GetObjectItem(j, "on");
+        if (cJSON_IsNumber(it)) on = (it->valueint != 0);
+        else if (cJSON_IsBool(it)) on = cJSON_IsTrue(it);
+        cJSON_Delete(j);
+    }
+    log_enable_reply(req, on);
+    return ESP_OK;
+}
+
+// 蓝牙模式下授时走 GET，紧接着自动开记录也只能走 GET，否则「授时成功但
+// 记录打不开」，用户看到的是时间对了、轨迹却一条不写。
+static esp_err_t handler_log_enable_get(httpd_req_t *req) {
+    char qs[32], v[12];
+    bool on = false;
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK &&
+        httpd_query_key_value(qs, "on", v, sizeof(v)) == ESP_OK) {
+        on = (strtoul(v, NULL, 10) != 0);
+    }
+    log_enable_reply(req, on);
+    return ESP_OK;
+}
+
+// 实时广播位置（供网页地图显示蓝点，每 2 秒被前端轮询）
+static esp_err_t handler_status(httpd_req_t *req) {
+    cn_crid_config_t *cfg = s_config;
+    cJSON *j = cJSON_CreateObject();
+    if (j == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    cJSON_AddNumberToObject(j, "latitude", cfg->latitude);
+    cJSON_AddNumberToObject(j, "longitude", cfg->longitude);
+    cJSON_AddNumberToObject(j, "altitude_msl", cfg->altitude_msl);
+    cJSON_AddNumberToObject(j, "heading", cfg->heading);
+    cJSON_AddNumberToObject(j, "speed", cfg->speed_horizontal);
+    // 堆诊断：TLS 会话是这台机器上最吃内存的东西，一旦握手时分配到 ESP_ERR_MBEDTLS_SSL_SETUP_FAILED
+    // 就会连 Wi-Fi 一起被拖垮（驱动自己也要大块连续内存）。把这三个数暴露出来，
+    // 网页每 2 秒轮询一次就能画出内存曲线，出问题不用瞎猜。
+    //   heap  = 当前可用；hmin = 开机以来最低水位；hblk = 最大连续块（决定能否再开一条 TLS）
+    cJSON_AddNumberToObject(j, "heap", (double)esp_get_free_heap_size());
+    cJSON_AddNumberToObject(j, "hmin", (double)esp_get_minimum_free_heap_size());
+    cJSON_AddNumberToObject(j, "hblk", (double)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    // 授时状态：设备无 RTC，时间全靠网页上报。页面据此显示「已校准/未校准」，
+    // 并显示设备当前时钟——秒针在走就是授时成功最直接的证据。
+    //   tsync = 1 已校准；tnow = 设备 Unix 秒（未校准时为 0）
+    uint64_t tnow = crid_time_epoch_ms();
+    cJSON_AddNumberToObject(j, "tsync", tnow ? 1 : 0);
+    cJSON_AddNumberToObject(j, "tnow", (double)(tnow / 1000));
+
+    const char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, s);
+    cJSON_free((void *)s);
+    cJSON_Delete(j);
+    return ESP_OK;
+}
+
+// 恢复出厂默认配置（保留消息计数器，防止接收端乱序）
+static esp_err_t handler_reset(httpd_req_t *req) {
+    cn_crid_config_t *cfg = s_config;
+    cn_crid_config_t next;
+    crid_config_init_default(&next);
+
+    bool band_changed = (next.band != cfg->band);
+    bool ap_changed = (strcmp(next.ssid, cfg->ssid) != 0) ||
+                      (strcmp(next.ap_password, cfg->ap_password) != 0) ||
+                      (next.channel != cfg->channel) ||
+                      (next.beacon_interval_ms != cfg->beacon_interval_ms) ||
+                      band_changed;
+    uint8_t saved_counter = cfg->message_counter;
+    *cfg = next;
+    cfg->message_counter = saved_counter;
+    cfg->latitude = cfg->base_latitude;
+    cfg->longitude = cfg->base_longitude;
+    cfg->altitude_msl = cfg->base_altitude_msl;
+    cfg->altitude_agl = cfg->altitude_msl - cfg->ground_altitude;
+
+    bool restarted = ap_changed;
+    crid_config_save_nvs(cfg);
+    ESP_LOGW(TAG, "Config reset to factory defaults via web (restarted=%d)", restarted);
+
+    // 同 POST /api/config：先回包再改热点，否则客户端在拿到响应前就被踢下线
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, restarted ? "{\"ok\":true,\"restarted\":true}"
+                                      : "{\"ok\":true,\"restarted\":false}");
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    if (ap_changed) {
+        esp_err_t ur = band_changed
+            ? crid_wifi_switch_band(cfg->band, cfg->ssid, cfg->ap_password,
+                                    crid_band_channel(cfg), cfg->beacon_interval_ms)
+            : crid_wifi_update_ap(cfg->ssid, cfg->ap_password,
+                                  crid_band_channel(cfg), cfg->beacon_interval_ms);
+        if (ur != ESP_OK) {
+            ESP_LOGE(TAG, "apply AP failed: %s", esp_err_to_name(ur));
+        }
+    }
+    // 恢复出厂回到 2.4G 发射（init_default 已设定），同步运行时状态
+    crid_app_apply_mode();
+    return ESP_OK;
+}
+
+// 浏览器会自动请求站点图标，返回 204 空响应避免 404 日志刷屏
+static esp_err_t handler_favicon(httpd_req_t *req) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+// 授时结果统一从这里出。关键：不能只看「传进来的值非零」就报成功——
+// crid_time 会拒绝 2023~2100 之外的时间（手机时间设错、刚开机取到 1970），
+// 那种情况下报文其实还是「未知」，页面必须知道，否则会误以为已校准、
+// 开着记录写一堆时间错误的轨迹，而且界面上一片安静，根本看不出问题。
+static void time_reply(httpd_req_t *req, uint64_t asked_ms) {
+    // 必须拿返回值判断：值被拒时设备会保留上一次校准，此时
+    // crid_time_epoch_ms() 仍然非 0，光看它会把「这次授时失败」报成成功。
+    bool accepted = crid_time_set_epoch_ms(asked_ms);
+
+    uint64_t now = crid_time_epoch_ms();
+    char out[80];
+    if (accepted && now != 0) {
+        snprintf(out, sizeof(out), "{\"ok\":true,\"now\":%llu}",
+                 (unsigned long long)(now / 1000));
+    } else {
+        snprintf(out, sizeof(out), "{\"ok\":false,\"now\":%llu}",
+                 (unsigned long long)(now / 1000));
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, out);
+}
+
+// 浏览器授时：设备无 RTC/不联网，用网页的 Unix 毫秒校准 GB46750 数据项 020
+static esp_err_t handler_time(httpd_req_t *req) {
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    cJSON *j = cJSON_Parse(buf);
+    uint64_t ms = 0;
+    if (j != NULL) {
+        cJSON *it = cJSON_GetObjectItem(j, "epoch_ms");
+        if (cJSON_IsNumber(it) && it->valuedouble > 0) {
+            ms = (uint64_t)it->valuedouble;
+        }
+        cJSON_Delete(j);
+    }
+    time_reply(req, ms);   // 0 = 清除校准；GB42590 / GB46750 共用同一基准
+    return ESP_OK;
+}
+
+// 蓝牙模式下网页只能发 GET（BLE 桥接只转发 GET，POST 会被页面拦下），
+// 但授时又必须走得通：手机关掉设备热点、只用蓝牙取数时，设备没有任何
+// 其他时间来源，轨迹会全部写成「未知」。
+static esp_err_t handler_time_get(httpd_req_t *req) {
+    char qs[48], v[28];
+    uint64_t ms = 0;
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK &&
+        httpd_query_key_value(qs, "ms", v, sizeof(v)) == ESP_OK) {
+        ms = strtoull(v, NULL, 10);
+    }
+    time_reply(req, ms);
+    return ESP_OK;
+}
+
+/**
+ * @brief 明文端口的唯一职责：把请求 302 到 https
+ *
+ * 页面与接口现在只挂在 443 上，书签或习惯里输 http://192.168.4.1 会打不开。
+ * 所以 80 端口保留一个通配 handler，原样带上网址与查询串跳到 https，用户什么都不用改。
+ *
+ * 用 302 而不是 301：301 会被浏览器长期缓存，一旦以后要回退成明文，缓存里那条
+ * 永久跳转几乎清不掉（用户只能清缓存或换浏览器）。302 每次都会重新问一次。
+ */
+static esp_err_t handler_redirect_https(httpd_req_t *req) {
+    // 缓冲区要按最坏情况给足：req->uri 最长 CONFIG_HTTPD_MAX_URI_LEN（512），
+    // 查询串再占一段。给少了 snprintf 会被 -Werror=format-truncation 判成潜在截断。
+    char qs[256];
+    char loc[864];
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK && qs[0] != '\0') {
+        snprintf(loc, sizeof(loc), "https://192.168.4.1%s?%s", req->uri, qs);
+    } else {
+        snprintf(loc, sizeof(loc), "https://192.168.4.1%s", req->uri);
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", loc);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static const httpd_uri_t uri_redirect = {
+    .uri = "/*", .method = HTTP_ANY, .handler = handler_redirect_https, .user_ctx = NULL
+};
+
+static const httpd_uri_t uris[] = {
+    { .uri = "/",          .method = HTTP_GET,  .handler = handler_page,      .user_ctx = NULL },
+    { .uri = "/rxmap.js",  .method = HTTP_GET,  .handler = handler_rxmapjs,   .user_ctx = NULL },
+    { .uri = "/api/config",.method = HTTP_GET,  .handler = handler_get_config,.user_ctx = NULL },
+    { .uri = "/api/config",.method = HTTP_POST, .handler = handler_post_config,.user_ctx = NULL },
+    { .uri = "/api/status",.method = HTTP_GET,  .handler = handler_status,    .user_ctx = NULL },
+    { .uri = "/api/rx",    .method = HTTP_GET,  .handler = handler_rx,        .user_ctx = NULL },
+    { .uri = "/api/reset", .method = HTTP_POST, .handler = handler_reset,     .user_ctx = NULL },
+    { .uri = "/api/time",  .method = HTTP_POST, .handler = handler_time,      .user_ctx = NULL },
+    { .uri = "/api/time",  .method = HTTP_GET,  .handler = handler_time_get,  .user_ctx = NULL },
+    { .uri = "/api/ota/info",  .method = HTTP_GET,  .handler = crid_ota_handler_info,   .user_ctx = NULL },
+    { .uri = "/api/ota/upload",.method = HTTP_POST, .handler = crid_ota_handler_upload, .user_ctx = NULL },
+    { .uri = "/api/log/info",  .method = HTTP_GET,  .handler = handler_log_info,   .user_ctx = NULL },
+    { .uri = "/api/log/points",.method = HTTP_GET,  .handler = handler_log_points, .user_ctx = NULL },
+    { .uri = "/api/log/export",.method = HTTP_GET,  .handler = handler_log_export, .user_ctx = NULL },
+    { .uri = "/api/log/clear", .method = HTTP_POST, .handler = handler_log_clear,  .user_ctx = NULL },
+    { .uri = "/api/log/del",   .method = HTTP_POST, .handler = handler_log_del,    .user_ctx = NULL },
+    // 蓝牙桥接只转发 GET，这两条让「删除 / 清空」也能走蓝牙（清空 handler 不读请求体，
+    // 同一个函数直接复用）。80 端口那段注册循环按 method==GET 自动放行，桥接无需改动。
+    { .uri = "/api/log/clear", .method = HTTP_GET,  .handler = handler_log_clear,  .user_ctx = NULL },
+    { .uri = "/api/log/del",   .method = HTTP_GET,  .handler = handler_log_del_get,.user_ctx = NULL },
+    { .uri = "/api/log/enable",.method = HTTP_POST, .handler = handler_log_enable, .user_ctx = NULL },
+    { .uri = "/api/log/enable",.method = HTTP_GET, .handler = handler_log_enable_get, .user_ctx = NULL },
+    { .uri = "/favicon.ico",.method = HTTP_GET, .handler = handler_favicon,   .user_ctx = NULL },
+};
+
+/** 把全部页面/接口挂到指定服务器（HTTPS 正常路径与 HTTP 降级路径共用） */
+static void register_all_uris(httpd_handle_t srv) {
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        esp_err_t r = httpd_register_uri_handler(srv, &uris[i]);
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "register uri %s failed: %s", uris[i].uri, esp_err_to_name(r));
+        }
+    }
+}
+
+// 证书由 CMakeLists 的 EMBED_TXTFILES 打进固件（main/certs/ 下的 PEM）
+extern const uint8_t servercert_pem_start[] asm("_binary_servercert_pem_start");
+extern const uint8_t servercert_pem_end[]   asm("_binary_servercert_pem_end");
+extern const uint8_t prvtkey_pem_start[]    asm("_binary_prvtkey_pem_start");
+extern const uint8_t prvtkey_pem_end[]      asm("_binary_prvtkey_pem_end");
+
+const char *crid_web_cert_pem(void) {
+    return (const char *)servercert_pem_start;
+}
+
+/**
+ * @brief 起 HTTPS 主服务：页面与接口的唯一入口
+ *
+ * 浏览器只在「安全上下文」里暴露 navigator.bluetooth，而 http://192.168.4.1
+ * 属于不安全来源，蓝牙会被直接隐藏。既然必须走 https 才有完整功能，就没必要再
+ * 维护一份明文页面：80 端口只留一个 302 跳转（见 handler_redirect_https），
+ * 全部 handler 只在 443 上注册，两边的行为不会再有分叉。
+ *
+ * 证书是自签的（main/certs，ECDSA P-256，有效期到 2046），浏览器首次会提示
+ * 不安全，点「继续访问」即可——这不影响功能，只是没有第三方背书。
+ *
+ * 返回 NULL 表示 TLS 没起来（多为内存不足），调用方会退回明文 HTTP 提供全部页面。
+ */
+/* ---------------- 会话登记表 ---------------- */
+/*
+ * 记下每个被 accept 的连接「什么时刻进来的」，用来区分「重连之前留下的死连接」与
+ * 「重连之后刚建立的新连接」。没有这个时间戳就只能一刀切全关，会误杀用户重连后
+ * 刚发出的第一个请求。
+ * 容量 16 足够：两台服务器最多 6+2 个并发槽，留足余量防 fd 复用错位。
+ */
+#define WEB_SESS_SLOTS 16
+static struct { int fd; int64_t ms; } s_sess_tab[WEB_SESS_SLOTS];
+
+static int64_t web_now_ms(void) {
+    return esp_timer_get_time() / 1000;
+}
+
+static void web_sess_note(int fd) {
+    int64_t now = web_now_ms();
+    int free_i = -1, oldest = 0;
+    for (int i = 0; i < WEB_SESS_SLOTS; i++) {
+        if (s_sess_tab[i].fd == fd) { s_sess_tab[i].ms = now; return; }   // fd 复用，刷新时间
+        if (s_sess_tab[i].fd <= 0) { if (free_i < 0) free_i = i; }
+        if (s_sess_tab[i].ms < s_sess_tab[oldest].ms) oldest = i;
+    }
+    int i = (free_i >= 0) ? free_i : oldest;
+    s_sess_tab[i].fd = fd;
+    s_sess_tab[i].ms = now;
+}
+
+static void web_sess_forget(int fd) {
+    for (int i = 0; i < WEB_SESS_SLOTS; i++) {
+        if (s_sess_tab[i].fd == fd) { s_sess_tab[i].fd = 0; s_sess_tab[i].ms = 0; return; }
+    }
+}
+
+/* 该 fd 的建立时刻（ms）；0 表示没有记录（例如明文 302 服务器上的会话） */
+static int64_t web_sess_ms(int fd) {
+    for (int i = 0; i < WEB_SESS_SLOTS; i++) {
+        if (s_sess_tab[i].fd == fd) return s_sess_tab[i].ms;
+    }
+    return 0;
+}
+
+/**
+ * @brief 新 TLS 连接建立前打点（只在内存偏紧时告警）
+ *
+ * 握手失败的唯一实测原因就是内存：allocate 拿不到就返回 -0x008D，随后 Wi-Fi
+ * 驱动自己也分配不到缓冲区，AP 掉线、网页彻底打不开。这个打点不改变任何行为，
+ * 只在快撑不住的时候留下一条日志，配合 /api/status 的 heap 曲线定位问题。
+ */
+static esp_err_t ssl_sess_open(httpd_handle_t hd, int sockfd) {
+    (void)hd;
+    web_sess_note(sockfd);
+    size_t free_sz = esp_get_free_heap_size();
+    size_t blk = (size_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    // 阈值取「真的快撑不住」的水位：空闲基线本身只有约 70KB，一次握手就会把
+    // 可用堆压到 40~50KB，用 64KB 当阈值等于每次握手都报警，反而淹没有效信息。
+    // 实测 24KB 以下才会出现 mbedtls 分配失败的前兆。
+    if (free_sz < 24576 || blk < 16384) {
+        ESP_LOGW(TAG, "TLS 新连接 fd=%d，内存偏紧: heap=%u hblk=%u",
+                 sockfd, (unsigned)free_sz, (unsigned)blk);
+    } else {
+        ESP_LOGD(TAG, "TLS 新连接 fd=%d heap=%u", sockfd, (unsigned)free_sz);
+    }
+    return ESP_OK;
+}
+
+/** 会话关闭时把登记表里的 fd 清掉，避免 fd 复用后拿旧时间戳误判新旧 */
+static void ssl_sess_close(httpd_handle_t hd, int sockfd) {
+    (void)hd;
+    web_sess_forget(sockfd);
+}
+
+/**
+ * @brief 回收残留会话
+ *
+ * 现象：手机连上热点打开网页，把 Wi-Fi 关掉再连回来，页面就一直转圈、超时打不开，
+ * 而且是「再也」打不开，不会自己好。机制（对着 httpd_main.c 的主循环看）：
+ *   设备侧收不到对方离开的通知，旧会话既不产生可读事件，也不会自己超时；
+ *   客户端槽一旦被这些死会话占满，httpd 就不再监听 listen_fd（只有
+ *   httpd_is_sess_available() 为真时才把 listen_fd 放进 select），
+ *   新连接根本不 accept → backlog 挤满 → lwIP 丢 SYN → 客户端一路重传到超时。
+ * 同时 lwIP 的 TIME_WAIT 也占着 active PCB 配额（默认 16 条），所以此前把 MSL
+ * 从 60s 降到 8s、把 PCB 上限提到 24（见 sdkconfig.defaults）。
+ *
+ * 本函数把两台服务器的会话全部关掉，把槽位立刻还给新连接。只在 num==0 时调用：
+ * 还有别的手机连着时不动，避免误杀正在进行的请求——尤其不能碰正在上传的 OTA 会话。
+ */
+static httpd_handle_t s_srv_http  = NULL;
+static httpd_handle_t s_srv_https = NULL;
+
+static int web_purge_one(httpd_handle_t hd) {
+    if (hd == NULL) return 0;
+    int fds[16];
+    size_t n = sizeof(fds) / sizeof(fds[0]);   // 入参=容量，出参=实际条数
+    if (httpd_get_client_list(hd, &n, fds) != ESP_OK) return 0;
+    int closed = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_sess_trigger_close(hd, fds[i]) == ESP_OK) closed++;
+    }
+    return closed;
+}
+
+/**
+ * @brief 只关掉「早于某个时刻建立」的会话
+ *
+ * 新客户端一接入，之前那批连接就全是死的；但同一时刻浏览器可能已经在发第一个请求，
+ * 新会话必须留着。用建立时间戳区分，比一刀切安全得多。
+ */
+static int web_purge_before(httpd_handle_t hd, int64_t before_ms) {
+    if (hd == NULL) return 0;
+    int fds[16];
+    size_t n = sizeof(fds) / sizeof(fds[0]);
+    if (httpd_get_client_list(hd, &n, fds) != ESP_OK) return 0;
+    int closed = 0;
+    for (size_t i = 0; i < n; i++) {
+        int64_t t = web_sess_ms(fds[i]);
+        if (t == 0 || t >= before_ms) continue;    // 无记录或新会话，不动
+        if (httpd_sess_trigger_close(hd, fds[i]) == ESP_OK) closed++;
+    }
+    return closed;
+}
+
+void crid_web_purge_sessions(void) {
+    int a = web_purge_one(s_srv_http);
+    int b = web_purge_one(s_srv_https);
+    if (a + b > 0) {
+        ESP_LOGW(TAG, "客户端已断开，回收残留会话 http=%d https=%d（空闲堆 %u）",
+                 a, b, (unsigned)esp_get_free_heap_size());
+    }
+}
+
+/* 新客户端接入的时刻，交给看门狗延迟清理「接入之前」的旧会话 */
+static volatile int64_t s_purge_before_ms = 0;
+
+static void web_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    (void)arg; (void)data;
+    if (base != WIFI_EVENT) return;
+    if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_sta_list_t lst;
+        memset(&lst, 0, sizeof(lst));
+        if (esp_wifi_ap_get_sta_list(&lst) == ESP_OK && lst.num == 0) {
+            crid_web_purge_sessions();
+        }
+    } else if (id == WIFI_EVENT_AP_STACONNECTED) {
+        // 有新客户端接入了：它之前的所有连接都已经作废（同一台手机重连时尤其如此）。
+        // 但此刻不能直接关——accept 刚发生，浏览器可能已经在发第一个请求，
+        // 所以记下时刻，交给看门狗延迟 800ms 后按时间戳只关旧的那些。
+        s_purge_before_ms = web_now_ms();
+    }
+}
+
+/**
+ * @brief 死连接的兜底回收（每 500ms 看一次）
+ *
+ * 为什么非关不可：看 httpd_main.c 的主循环，
+ *   select(maxfd + 1, &read_set, NULL, NULL, NULL)      // 超时 = 无限等
+ *   并且只有 httpd_is_sess_available() 为真时才会把 listen_fd 放进 read_set。
+ * 也就是说：客户端消失后，它留下的会话既不会产生可读事件（select 永远不返回它），
+ * 也不会自己超时释放；只要槽位被这样的死会话占满，httpd 连 listen_fd 都不再监听，
+ * 新连接一律不接受 → backlog 挤满 → lwIP 丢 SYN → 手机侧 ERR_CONNECTION_TIMED_OUT，
+ * 而且不会自愈（这正是「断开 Wi-Fi 再连就再也打不开」的机制）。
+ *
+ * 所以必须有外力主动回收，两条判据互为补充：
+ *   1) 新客户端接入 → 关掉「建立超过 WEB_STALE_MS」的老会话（OTA 上传期间跳过）
+ *   2) AP 上一个客户端都没有 → 全关（事件可能读不到已归零的 sta 列表，靠轮询兜底）
+ *
+ * 判据 1 曾经是「关掉接入之前建立的全部会话」，那会在同时用两台设备时误杀另一台
+ * 正在进行的 OTA（一次上传十几秒，接入事件正好落在中间）。现在槽位扩到 6，
+ * 不再需要用一刀切来换空位，改成只按年龄判定：正常请求都在 3 秒内结束。
+ * 但 OTA 上传本身就超过 10 秒（实测 1.39MB / 117KB/s = 11.6 秒），单靠年龄仍会
+ * 误杀，所以额外用 crid_ota_busy() 做豁免——这是「传输类长连接」的唯一豁免口。
+ */
+#define WEB_STALE_MS 10000
+
+static void web_guard_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        int64_t now = web_now_ms();
+
+        // 判据 1：新客户端接入后，清掉已经挂了很久的老会话
+        //
+        // 但 OTA 上传正在进行时必须整体跳过：一次 1.39MB 的镜像在 117KB/s 下要
+        // 11~12 秒，比 WEB_STALE_MS 还长，正好落进「超龄」区间；此时只要有设备
+        // 重连（安装事件），上传连接就会被当成死连接关掉，用户看到的就是
+        // 「传了一半突然失败 / 进度条不动」。
+        int64_t pb = s_purge_before_ms;
+        if (pb > 0 && now - pb >= 800) {
+            s_purge_before_ms = 0;
+            if (crid_ota_busy()) {
+                ESP_LOGI(TAG, "OTA 上传进行中，跳过超龄会话清理");
+            } else {
+                int64_t cutoff = now - WEB_STALE_MS;
+                int oa = web_purge_before(s_srv_http,  cutoff);
+                int ob = web_purge_before(s_srv_https, cutoff);
+                if (oa + ob > 0) {
+                    ESP_LOGW(TAG, "新客户端接入，清掉超龄会话 http=%d https=%d（heap=%u）",
+                             oa, ob, (unsigned)esp_get_free_heap_size());
+                }
+            }
+        }
+
+        // 判据 2：一个客户端都没有时，残留会话必然全是死的
+        wifi_sta_list_t lst;
+        memset(&lst, 0, sizeof(lst));
+        if (esp_wifi_ap_get_sta_list(&lst) != ESP_OK) continue;
+        if (lst.num > 0) continue;          // 有人连着就不动，可能是多机共用
+        int a = web_purge_one(s_srv_http);
+        int b = web_purge_one(s_srv_https);
+        if (a + b > 0) {
+            ESP_LOGW(TAG, "无客户端在线，清掉残留会话 http=%d https=%d（heap=%u）",
+                     a, b, (unsigned)esp_get_free_heap_size());
+        }
+    }
+}
+
+static httpd_handle_t start_https_server(void) {
+    httpd_ssl_config_t ssl_cfg = HTTPD_SSL_CONFIG_DEFAULT();
+    ssl_cfg.servercert     = servercert_pem_start;
+    ssl_cfg.servercert_len = (size_t)(servercert_pem_end - servercert_pem_start);
+    ssl_cfg.prvtkey_pem    = prvtkey_pem_start;
+    ssl_cfg.prvtkey_len    = (size_t)(prvtkey_pem_end - prvtkey_pem_start);
+
+    ssl_cfg.httpd.max_uri_handlers = sizeof(uris) / sizeof(uris[0]) + 2;
+    ssl_cfg.httpd.open_fn          = ssl_sess_open;
+    ssl_cfg.httpd.close_fn         = ssl_sess_close;   // 会话结束时清登记表，防 fd 复用误判
+    // 不能开 lru_purge：槽位不够时它会掐掉「最久未使用」的连接，而被掐的往往正是
+    // 正在发 /api/config 的那条，页面拿不到配置就会参数全空。宁可让新连接在
+    // backlog 里排队等槽位释放（keep_alive 默认关，响应完即关闭，等不了几毫秒）。
+    // 不能开 lru_purge：它会掐掉「最久没完成请求」的会话，而 OTA 上传是一个长达
+    // 十几秒的未完成请求，lru 计数全程不刷新，正好排在队首——一次误杀就等于升级失败。
+    // 代价是槽位满时 httpd 不再监听 listen_fd（见 httpd_main.c 主循环），所以槽位数
+    // 必须真的够用，见下面的分配。
+    ssl_cfg.httpd.lru_purge_enable = false;
+    ssl_cfg.httpd.stack_size       = 10240;   // TLS 握手比明文更吃栈
+    // ---- 客户端槽位分配 ----
+    // 槽位不再是"省内存"的旋钮，而是"能不能同时服务两台设备"的硬门槛：
+    // 浏览器对同一 origin 会开 6 条连接，一台设备打满就把 3 个槽占尽，第二台设备
+    // （手机）一到就没有空槽 → httpd 停止 accept → 表现为「电脑能开、手机一直转圈」。
+    //   S3：空闲堆约 200KB，单条 TLS 会话峰值约 16KB，给 6 个槽（与浏览器连接数对齐）
+    //   C5：跑起 AP+BLE 后空闲堆只有约 70KB，给 4 个（再多会在 4 路并发时 OOM 拖垮 Wi-Fi）
+    // 每个 httpd 实例另占 3 个内部 socket：HTTP 2+3=5、HTTPS 6+3=9，加蓝牙桥接 1、
+    // DHCP/DNS 2、SNTP 1 → 18，CONFIG_LWIP_MAX_SOCKETS 相应提到 24（见 sdkconfig.defaults）。
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    ssl_cfg.httpd.max_open_sockets = 4;
+#else
+    ssl_cfg.httpd.max_open_sockets = 6;
+#endif
+    // 死连接尽快让出槽位：客户端拔网后设备侧收不到 RST，只能等超时。
+    // 默认 5s 偏保守，改 3s——正常请求都是毫秒级完成，不会误杀。
+    ssl_cfg.httpd.recv_wait_timeout = 3;
+    ssl_cfg.httpd.send_wait_timeout = 3;
+    ssl_cfg.httpd.server_port      = 443;
+    ssl_cfg.port_secure            = 443;
+    // 握手必须尽快失败：httpd 任务是一个个串行握手的，客户端已经消失时，一个卡住的
+    // 握手会把整个服务器挡住——期间新连接只能堆在 backlog 里，堆满就开始丢 SYN，
+    // 手机侧就是 ERR_CONNECTION_TIMED_OUT。默认 8s 太长（槽位全卡 = 数十秒毫无响应），
+    // 局域网内真实握手在 100~300ms 内完成，1.5s 足够宽松。
+    ssl_cfg.tls_handshake_timeout_ms = 1500;
+    // 重连瞬间浏览器会并发开 6 条，槽位已被前面占满，其余必须能在 backlog 里等。
+    // 默认 5 太小，一轮并发就填满，调大后多扛几条能明显减少「第一次打不开」。
+    ssl_cfg.httpd.backlog_conn = 12;
+
+    httpd_handle_t srv = NULL;
+    esp_err_t ret = httpd_ssl_start(&srv, &ssl_cfg);
+    if (ret != ESP_OK) {
+        // 内存不够时 TLS 起不来。此时没有 https 可用，调用方会退回「HTTP 提供全部页面」，
+        // 功能不受影响，只是蓝牙数据通道不可用。
+        ESP_LOGW(TAG, "HTTPS 未启动（%s），将退回 HTTP", esp_err_to_name(ret));
+        return NULL;
+    }
+    register_all_uris(srv);
+    s_srv_https = srv;      // 供客户端断开时回收残留会话
+    ESP_LOGI(TAG, "HTTPS 已启动: https://192.168.4.1 (heap=%u hblk=%u)",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    return srv;
+}
+
+esp_err_t crid_web_start(cn_crid_config_t *config) {
+    if (config == NULL) return ESP_ERR_INVALID_ARG;
+    s_config = config;
+
+    // 先把 HTTPS 起起来：它是页面与接口的唯一入口。
+    // 起不来（内存不足）才退回明文 HTTP 提供全部 handler，保证网页总打得开。
+    bool https_ok = (start_https_server() != NULL);
+
+    httpd_handle_t server = NULL;
+    httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
+    // 默认的 uri_match_fn 是「字符串全等」，认不出 "/*"；跳转 handler 要靠通配匹配所有路径
+    http_cfg.uri_match_fn = httpd_uri_match_wildcard;
+    if (https_ok) {
+        // 正常路径：80 端口给蓝牙桥接放行明文 GET /api/*，其余路径 302 跳转 https。
+        // crid_ble.c 的桥接客户端访问 http://<AP_IP>/api/…，若这里全部跳转，
+        // 它会拿到 302 并当成失败（手机端表现为「设备返回非 200」）。
+        http_cfg.max_uri_handlers = sizeof(uris) / sizeof(uris[0]) + 2;
+        // 蓝牙桥接一次一条连接；明文只剩「浏览器访问 http:// 拿到 302」这一种用途，
+        // 一跳就走到 https，2 个槽足够，其余 socket 全留给 HTTPS。
+        http_cfg.max_open_sockets = 2;
+        http_cfg.stack_size = 4096;
+    } else {
+        // 降级路径：跟以前一样，全部 handler 挂到 80 端口
+        // 槽位数必须覆盖 uris[] 全部条目（IDF 6.1 默认为 8，路由表已 19 条），
+        // 否则超出部分会以 ESP_ERR_HTTPD_HANDLERS_FULL 静默失败、对应接口 404。
+        http_cfg.max_uri_handlers = sizeof(uris) / sizeof(uris[0]) + 2;
+        // 默认 4KB 栈对 OTA 升级偏紧：esp_ota_begin/end 要做 SHA256 校验与分区操作，
+        // 加上 cJSON 构包，留 8KB 更稳妥（只有一个 httpd 任务，代价可忽略）
+        http_cfg.stack_size = 8192;
+        http_cfg.max_open_sockets = 6;
+    }
+    http_cfg.lru_purge_enable = false;   // 理由见 start_https_server() 里的注释
+    // 死连接别占着槽位等默认的 5 秒（重连卡死的问题见 web_wifi_event 的注释）
+    http_cfg.recv_wait_timeout = 3;
+    http_cfg.send_wait_timeout = 3;
+
+    esp_err_t ret = httpd_start(&server, &http_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(ret));
+        // HTTPS 已经跑起来了就不算致命：页面照样能开，只是少了 http 跳转
+        return https_ok ? ESP_OK : ret;
+    }
+    if (https_ok) {
+        // 先注册具体的 GET /api/*，最后挂通配跳转：httpd 按注册顺序匹配，
+        // 这样蓝牙桥接拿到 200，页面/其它路径仍然 302 到 https。
+        for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+            if (uris[i].method == HTTP_GET && strncmp(uris[i].uri, "/api/", 5) == 0) {
+                esp_err_t r = httpd_register_uri_handler(server, &uris[i]);
+                if (r != ESP_OK) {
+                    ESP_LOGW(TAG, "注册明文接口 %s 失败: %s", uris[i].uri, esp_err_to_name(r));
+                }
+            }
+        }
+        esp_err_t r = httpd_register_uri_handler(server, &uri_redirect);
+        if (r != ESP_OK) {
+            ESP_LOGW(TAG, "注册 https 跳转失败（%s），直接输 http 会打不开", esp_err_to_name(r));
+        }
+        ESP_LOGI(TAG, "Web 已就绪: https://192.168.4.1（80 端口放行 GET /api，其余 302 跳转）");
+    } else {
+        register_all_uris(server);
+        ESP_LOGW(TAG, "Web 已就绪: http://192.168.4.1（HTTPS 未启动，蓝牙通道不可用）");
+    }
+    s_srv_http = server;    // 供客户端断开时回收残留会话
+
+    // 手机把 Wi-Fi 关掉再连回来时，旧连接在设备侧是「半死」的：既不会收到 FIN，
+    // 也不会报错，只占着客户端槽位与 lwIP 的 TCP PCB，新连接于是排队到浏览器超时。
+    // 订阅「客户端断开」事件，最后一个客户端走光就把两边会话一起回收（非阻塞，
+    // 只是往 httpd 任务里投递关闭请求）。
+    esp_err_t er = esp_event_handler_instance_register(
+        WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, web_wifi_event, NULL, NULL);
+    if (er != ESP_OK) {
+        ESP_LOGW(TAG, "订阅 Wi-Fi 断开事件失败（%s），重连后可能卡住", esp_err_to_name(er));
+    }
+    // 事件可能读不到「已归零」的 sta 列表，再加一层轮询兜底（理由见 web_guard_task）
+    static bool guard_started = false;
+    if (!guard_started) {
+        if (xTaskCreate(web_guard_task, "web_guard", 3072, NULL, 2, NULL) == pdPASS) {
+            guard_started = true;
+        } else {
+            ESP_LOGW(TAG, "看门狗任务创建失败，重连后需等旧会话自己超时");
+        }
+    }
+    return ESP_OK;
+}

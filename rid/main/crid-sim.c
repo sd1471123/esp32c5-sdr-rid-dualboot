@@ -1,0 +1,299 @@
+/**
+ * @file crid-sim.c
+ * @brief ESP32 中国民用无人机远程识别 (C-RID) 模拟器 - 主入口
+ *
+ * 双模式（网页可切换，NVS 持久化）:
+ *   - 发射模式: softAP vendor IE 广播 RID（GB 42590-2023 旧国标 /
+ *     GB 46750-2025 新国标）
+ *   - 接收模式: 混杂模式监听周边无人机 RID 广播并解析（网页展示）
+ *
+ * softAP 始终运行（网页配置入口 http://192.168.4.1 不受模式影响）。
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+
+#include "crid_config.h"
+#include "crid_messages.h"
+#include "crid_gb46750.h"
+#include "crid_wifi.h"
+#include "crid_web.h"
+#include "crid_ota.h"
+#include "crid_log.h"
+#include "crid_patrol.h"
+#include "crid_rx.h"
+#include "crid_ble.h"
+#include "crid_lcd.h"
+#include "dual_boot.h"
+
+static const char *TAG = "ESP32_CRID_STD";
+
+// --- 全局 RID 厂商 IE 缓冲区 ---
+#define RID_IE_BUF_SIZE 160
+static uint8_t g_rid_ie_42590[RID_IE_BUF_SIZE];   // 槽位1: GB42590 打包报文
+static uint8_t g_rid_ie_46750[RID_IE_BUF_SIZE];   // 槽位0: GB46750 位图报文
+static bool    s_gb_ie_logged = false;            // 报文头是否已打印（每次切换标准重置）
+
+// --- 全局配置 ---
+static cn_crid_config_t g_config;
+
+// --- 发射端当前生效的标准快照（检测网页切换，触发 IE 重建） ---
+static uint8_t s_applied_standard = 0xFF;
+
+// --- 主循环节拍与位置更新间隔 ---
+// 主循环用固定 50 ms 节拍：广播 IE 按网页设置的间隔重建，位置按 1 Hz 推进。
+// 两者解耦的原因：旧实现直接 vTaskDelay(beacon_interval)，位置也只能跟着
+// 同一个延时走（固定 10 秒才更新一次），于是「位置 10 秒不动、时间戳每秒
+// 在涨」——这正是合成轨迹最典型的特征。真机的位置是 1 Hz 刷新的。
+#define MAIN_TICK_MS        50
+#define PATROL_INTERVAL_MS  1000
+
+/**
+ * @brief 按当前标准把 IE 挂到对应槽位
+ *
+ * 标准切换时先清空两个槽位再重挂，避免残留旧标准 IE。
+ * @return true = 发射生效（任一 IE 挂载成功）
+ */
+static bool apply_tx_ie(void) {
+    uint8_t std = g_config.rid_standard;
+
+    if (std != s_applied_standard) {
+        // 标准变化: 清空双槽位，下一轮重挂
+        crid_wifi_clear_rid_ie(0);
+        crid_wifi_clear_rid_ie(1);
+        s_applied_standard = std;
+        s_gb_ie_logged = false;
+        ESP_LOGI(TAG, "广播标准切换: %s",
+                 std == RID_STD_GB42590 ? "GB42590 旧国标" : "GB46750 新国标");
+    }
+
+    bool ok = false;
+    if (std == RID_STD_GB42590) {
+        uint16_t len = crid_build_vendor_ie(&g_config, g_rid_ie_42590, RID_IE_BUF_SIZE);
+        if (len > 0 && crid_wifi_set_rid_ie(1, g_rid_ie_42590, len) == ESP_OK) ok = true;
+    }
+    if (std == RID_STD_GB46750) {
+        uint16_t len = crid_build_gb46750_ie(&g_config, g_rid_ie_46750, RID_IE_BUF_SIZE);
+        if (len > 0 && crid_wifi_set_rid_ie(0, g_rid_ie_46750, len) == ESP_OK) {
+            ok = true;
+            // 首次挂载时打印完整报文，便于与 GB 46750-2025 表1/表2/表3 逐字节核对
+            if (!s_gb_ie_logged) {
+                ESP_LOGI(TAG, "GB46750 IE %uB: [DD][len][FA 0B BC][F0][FF][ver][dlen][flags x3][content]",
+                         len);
+                ESP_LOG_BUFFER_HEX(TAG, g_rid_ie_46750, len);
+                s_gb_ie_logged = true;
+            }
+        }
+    }
+    return ok;
+}
+
+/**
+ * @brief 应用当前收发开关（网页保存 / 启动时调用）
+ *
+ * 发射与接收是两个独立开关，可以同时打开：softAP 在硬件层面持续发 Beacon，
+ * 同时混杂模式接收同信道的管理帧，单射频下二者共用同一个信道，互不冲突。
+ * 两者都关是禁止状态（网页端已拦截），这里再兜底按发射处理。
+ */
+void crid_app_apply_mode(void) {
+    uint8_t ch = crid_band_channel(&g_config);
+    bool tx = crid_band_tx_enabled(&g_config);
+    bool rx = crid_band_rx_enabled(&g_config);
+
+    if (rx) {
+        crid_rx_start(ch);           // 已在跑则直接返回
+    } else {
+        crid_rx_stop();
+    }
+
+    if (tx) {
+        s_applied_standard = 0xFF;   // 强制下一轮重建 IE
+    } else {
+        crid_wifi_clear_rid_ie(0);
+        crid_wifi_clear_rid_ie(1);
+        s_applied_standard = 0xFF;
+    }
+
+    ESP_LOGI(TAG, "射频状态: 频段=%s 信道=%u 发射=%s 接收=%s",
+             g_config.band == CRID_BAND_5G ? "5.8G" : "2.4G", ch,
+             tx ? "开" : "关", rx ? "开" : "关");
+}
+
+/**
+ * @brief C-RID 主任务（按开关分别维护发射 IE 与接收监听）
+ */
+static void crid_main_task(void *pvParameter) {
+    ESP_LOGI(TAG, "C-RID main task started (band=%s tx=%u rx=%u)",
+             g_config.band == CRID_BAND_5G ? "5.8G" : "2.4G",
+             crid_band_tx_enabled(&g_config), crid_band_rx_enabled(&g_config));
+
+    TickType_t lastIe  = 0;
+    TickType_t lastPos = xTaskGetTickCount();
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(MAIN_TICK_MS));
+        TickType_t now = xTaskGetTickCount();
+
+        // --- RID IE 重建：按网页设置的广播间隔 ---
+        uint32_t ie_period = g_config.beacon_interval_ms;
+        if (ie_period < 100) ie_period = 1000;      // 兜底，避免误配成 0 导致空转
+        if ((uint32_t)pdTICKS_TO_MS(now - lastIe) >= ie_period) {
+            if (crid_band_tx_enabled(&g_config)) {
+                if (!apply_tx_ie()) {
+                    ESP_LOGE(TAG, "Failed to set RID vendor IE");
+                }
+            } else if (s_applied_standard != 0xFF) {
+                // 发射关闭: 确保 IE 已摘除，AP 继续发空 Beacon
+                crid_wifi_clear_rid_ie(0);
+                crid_wifi_clear_rid_ie(1);
+                s_applied_standard = 0xFF;
+                ESP_LOGI(TAG, "发射已关闭，RID IE 从 Beacon 摘除");
+            }
+            lastIe = now;
+        }
+
+        // --- 位置 1 Hz 推进 ---
+        // dt 用实测节拍而不是常量：调度抖动时按真实间隔算角度增量，
+        // 保证「位移 = 速度 × 时间」严格成立，长时间运行也不累积误差。
+        uint32_t dt_ms = (uint32_t)pdTICKS_TO_MS(now - lastPos);
+        if (dt_ms >= PATROL_INTERVAL_MS) {
+            if (crid_band_tx_enabled(&g_config)) {
+                crid_patrol_step(&g_config, (float)dt_ms / 1000.0f);
+            }
+            lastPos = now;
+        }
+    }
+}
+
+/**
+ * @brief 应用主入口
+ */
+void app_main(void) {
+    ESP_LOGI(TAG, "=== ESP32 China C-RID Simulator ===");
+    ESP_LOGI(TAG, "Standards: GB42590-2023 / GB46750-2025");
+
+    // 固件版本与运行分区：网页「固件升级」卡显示的就是这里的版本，
+    // OTA 之后重启能立刻看出到底跑的是哪一版、在哪个槽
+    {
+        const esp_app_desc_t *desc = esp_app_get_description();
+        const esp_partition_t *runp = esp_ota_get_running_partition();
+        ESP_LOGI(TAG, "Firmware %s on partition '%s' (%u KB)",
+                 (desc && desc->version[0]) ? desc->version : "?",
+                 runp ? runp->label : "?",
+                 (unsigned)(runp ? runp->size / 1024 : 0));
+    }
+
+    // 0. 日志降噪：以下两类是协议栈的常规噪音，不反映任何故障
+    //    - httpd_txrx: 手机端关闭页面/切后台/网络切换会主动 RST 连接（errno 104 ECONNRESET），
+    //      ESP-IDF httpd 只是优雅关闭该 socket 并继续服务，属于正常路径；
+    //    - wifi: AP 模式下的 Block ACK 维护（ADDBA RX DELBA），属 WiFi 协议栈例行日志。
+    //    只关这两个 TAG，CN_C-RID_* 业务日志与其它组件日志全部保留。
+    esp_log_level_set("httpd_txrx", ESP_LOG_NONE);
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+
+    // 1. 初始化 NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 合并工程：确认本次 OTA 状态，然后把下一次启动目标交还 launcher。
+    // 这样每次开机都会先出现 SDR / RID 选择菜单；RID 内部的网页 OTA 依然
+    // 只会在 rid_a / rid_b 两个槽之间轮换。
+    dualboot_confirm_running();
+    dualboot_release_to_launcher();
+
+    // 2. 初始化 TCP/IP 网络接口
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    // 3. 创建默认事件循环
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // 4. 初始化 C-RID 配置（默认值 + NVS 已保存的用户配置）
+    crid_config_init_default(&g_config);
+    crid_config_load_nvs(&g_config);
+
+    // 4.1 本地 TFT 面板（合并工程新增）：沿用 SDR tft 分支的接线与 5 个按键，
+    //     在设备上直接显示 RID 状态 / 收到的目标，并可从面板编辑配置并保存。
+    crid_lcd_start(&g_config);
+
+    // 5. 初始化 Wi-Fi（softAP 始终运行：网页配置入口；band 决定 2.4G / 5.8G）
+    ret = crid_wifi_init_ap(g_config.band, crid_band_channel(&g_config),
+                            g_config.ssid, g_config.ap_password, g_config.beacon_interval_ms);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    // 把热点口令打到串口：这是忘记密码时唯一的就地找回途径（能插 USB 的人
+    // 本来就能重烧固件，所以明文打印不降低安全性）
+    ESP_LOGI(TAG, "热点 SSID: %s  密码: %s", g_config.ssid,
+             g_config.ap_password[0] ? g_config.ap_password : "(开放，无密码)");
+
+    // 6. 应用初始工作模式（接收模式则开启混杂监听）
+    crid_app_apply_mode();
+
+    // 7. 启动主任务
+    BaseType_t task_ret = xTaskCreate(crid_main_task, "cn_crid_main",
+                                      6144, NULL, 5, NULL);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create main task!");
+        return;
+    }
+
+    // 8. 启动网页配置服务器（手机连接热点后访问 http://192.168.4.1）
+    crid_ota_init();   // 本次上电的 OTA 上传令牌
+    // 接收端轨迹持久化：分区缺失（旧分区表）时只在日志里警告，不影响收发
+    crid_log_init();
+    if (crid_web_start(&g_config) != ESP_OK) {
+        ESP_LOGE(TAG, "Web config server failed to start!");
+    }
+
+    // 8.1 蓝牙数据通道：网页可以改用 BLE 取数据，从而腾出 Wi-Fi 上网看地图
+    //     依赖本机 httpd（桥接任务要访问 192.168.4.1），必须排在 web 之后。
+    //     蓝牙起不来只是少一条通道，Wi-Fi 下的使用完全不受影响。
+    if (crid_ble_init() != ESP_OK) {
+        ESP_LOGW(TAG, "BLE 数据通道未启用");
+    }
+
+    // 9. 保险起见再确认一次 OTA 状态。合并工程在启动时已经确认并把启动目标
+    //    交还 launcher，这里再调一次是幂等的，不会打误导性的错误日志。
+    dualboot_confirm_running();
+
+    ESP_LOGI(TAG, "C-RID started successfully! (band=%s, tx=%u, rx=%u, std=%u)",
+             g_config.band == CRID_BAND_5G ? "5.8G" : "2.4G",
+             crid_band_tx_enabled(&g_config), crid_band_rx_enabled(&g_config),
+             g_config.rid_standard);
+    ESP_LOGI(TAG, "  UAS ID (Model): %s", g_config.uas_id);
+    ESP_LOGI(TAG, "  Drone Name: %s", g_config.drone_name);
+    ESP_LOGI(TAG, "  Operator ID: %s", g_config.operator_id);
+    ESP_LOGI(TAG, "  MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             g_config.mac_address[0], g_config.mac_address[1], g_config.mac_address[2],
+             g_config.mac_address[3], g_config.mac_address[4], g_config.mac_address[5]);
+    ESP_LOGI(TAG, "  Position: %.6f, %.6f", g_config.latitude, g_config.longitude);
+    ESP_LOGI(TAG, "  Band: %s, Channel: %u, Interval: %ums",
+             g_config.band == CRID_BAND_5G ? "5.8G" : "2.4G",
+             crid_band_channel(&g_config), g_config.beacon_interval_ms);
+    ESP_LOGI(TAG, "  Web config: http://192.168.4.1");
+
+    // 临时校验用：构建一份 GB46750 报文并打印（不改变当前广播标准）
+    {
+        static uint8_t dbg[160];
+        uint16_t n = crid_build_gb46750_ie(&g_config, dbg, sizeof(dbg));
+        if (n) {
+            ESP_LOGI(TAG, "GB46750 IE preview %uB", n);
+            ESP_LOG_BUFFER_HEX(TAG, dbg, n);
+        }
+    }
+}

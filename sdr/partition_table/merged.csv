@@ -1,0 +1,22 @@
+﻿# 合并工程分区表 — ESP32-C5 / 16 MB Flash
+#
+#  name      type subtype  offset     size     说明
+#  launcher  factory       0x20000    1M       开机选择菜单（每次开机默认启动这里）
+#  sdr       ota_0         0x120000   2M       esp-sdr tft 分支固件
+#  rid_a     ota_1         0x320000   3M       C-RID 固件槽 A
+#  rid_b     ota_2         0x620000   3M       C-RID 固件槽 B（网页 OTA 目标）
+#  ridlog    data 0x40     0x920000   4M       C-RID 接收轨迹日志
+#
+# 注意：
+#  - otadata 被清空时 bootloader 启动 factory(launcher)，所以菜单每次开机都会出现。
+#  - 进入 SDR/RID 后，应用会把 otadata 再次清掉，下一次开机重新回到菜单。
+#  - RID 的网页 OTA 只能在 rid_a / rid_b 之间轮换，绝不允许写到 sdr 槽。
+#  - 本表改动后必须整片重烧一次（bootloader + partition-table + 三个 app）。
+nvs,      data, nvs,     0x9000,   24K,
+phy_init, data, phy,     0xf000,   4K,
+otadata,  data, ota,     0x10000,  8K,
+factory,  app,  factory, 0x20000,  1M,
+sdr,      app,  ota_0,   0x120000, 2M,
+rid_a,    app,  ota_1,   0x320000, 3M,
+rid_b,    app,  ota_2,   0x620000, 3M,
+ridlog,   data, 0x40,    0x920000, 4M,

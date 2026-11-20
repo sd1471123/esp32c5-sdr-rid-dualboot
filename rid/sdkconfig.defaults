@@ -1,0 +1,87 @@
+# 跨芯片共用默认配置（esp32s3 / esp32c5 等）
+# 自定义分区表：factory + ota_0 + ota_1 三个 app 槽，各 2MB
+# （见 partition_table/partitionTable.csv）
+# 内置默认 1MB app 分区对 RISC-V 目标（C3/C5/C6）偏小，固件约 1.03MB 会溢出
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partition_table/merged.csv"
+
+# 固件回滚：网页 OTA 写入的新固件带 PENDING_VERIFY 标记，只有在 app_main
+# 完成全部初始化并调用 esp_ota_mark_app_valid_cancel_rollback() 后才算确认；
+# 若新固件在这之前崩溃/复位，引导器自动退回上一版可用的固件。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ---- 蓝牙数据通道 + HTTPS（网页 Web Bluetooth 取数，腾出 Wi-Fi 上网看地图） ----
+# 只开 BLE 外设 + 广播角色：手机当中心设备连上来读数据，省 flash 与 RAM
+# （Bluedroid 双模用不上，NimBLE 体积只有它的一半左右）
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# Wi-Fi AP 与 BLE 共用一根天线，必须开软件共存
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# 浏览器只在安全上下文（https / localhost）里暴露 navigator.bluetooth，
+# 所以网页要能通过 https://192.168.4.1 打开。证书是自签的，见 main/certs/。
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+# TLS 收发缓冲。这里踩过最大的一个坑，务必看完再改：
+#   浏览器和 OpenSSL 在握手时不协商 max_fragment_length，默认按 **16384 字节**切 TLS 记录。
+#   IN_CONTENT_LEN 若小于 16KB，设备收到 16KB 记录会判为记录溢出，直接把连接打断；
+#   而客户端此时还以为在正常发送（数据堆在内核发送缓冲里），表现为：
+#     · 网页「固件升级」进度条走到 60%~62%（约 800KB）后纹丝不动，页面永远显示上传中
+#     · 用裸 socket 分块发送时，恰好卡在发送缓冲被灌满的位置（64KB 块约 655KB，8KB 块约 819KB）
+#     · 唯一能过的是 **4096 字节**分块——正好等于原来的 IN_CONTENT_LEN，因为记录没超限
+#   这条线索把「内存不足」「flash 锁竞争」「会话被回收」全部排除：卡住期间 /api/status
+#   正常响应 0.86s，heap 44~52KB、最大连续块 26KB，ridlog 日志本来就是关的，设备也没重启。
+# 取值：IN=16384（等于客户端默认记录上限，必须够）；
+#   OUT 保持 2048——设备发出的响应用不着大记录，页面 gzip 31KB 会被拆成十几个小记录照发不误。
+# 代价：每条 TLS 连接的收缓冲上限从 4KB 变 16KB。配下面的 DYNAMIC_BUFFER 后，空闲会话把缓冲
+#   还给堆，只有并发活跃时才真占，S3 6 条并发峰值约 96KB（实测基线 heap 91KB，OTA 单连接够用）。
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+# 动态收发缓冲：不用时把缓冲还给堆，会话空闲期间只留 mbedTLS 上下文。
+# 这是给 C5 这种小内存 + 并发 TLS 场景最关键的一项，能把最低水位从 9KB 抬回 20KB 以上。
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# ---- lwIP socket 池 ----
+# 关键：esp_http_server 每个实例除了 max_open_sockets 个客户端槽，还要额外占 3 个
+# socket（TCP 监听 + 收/发控制口），见 httpd_main.c 的 sanity check。
+# 本项目同时跑 80（HTTP）和 443（HTTPS）两个实例，默认 10 个根本不够。
+# 现在的分配（槽位见 crid_web.c：S3 HTTPS 6 / C5 HTTPS 4，HTTP 均为 2）：
+#   2+3(HTTP) + 6+3(HTTPS) + 蓝牙桥接 1 + DHCP/DNS 2 + SNTP 1 = 18，池子取 24 留 6 条余量。
+# 池子只有 20 时实测会打到 ENFILE：日志为 httpd_accept_conn: error in accept (23)，
+# 紧接着 httpd_server: error accepting new connection——新连接直接被拒，第二台设备打不开。
+CONFIG_LWIP_MAX_SOCKETS=24
+
+# ---- lwIP TCP：让「手机断开热点」留下的死连接尽快释放 ----
+# 现象：手机开着网页把 Wi-Fi 关掉再连回来，页面一直转圈、超时，等一两分钟才恢复。
+# 原因是设备侧收不到对方消失的通知：旧连接还占着 httpd 的客户端槽（HTTP 6 / HTTPS 3），
+# 新连接只能在 backlog 里排队；同时 lwIP 的 TCP PCB 也被 TIME_WAIT 占着（默认只有
+# 16 条），重连瞬间挤满就再也接不上新连接。
+#   MSL 60s -> 8s：TIME_WAIT / FIN_WAIT 从 2×60s 降到 2×8s，PCB 十几秒就回池
+#   MAX_ACTIVE_TCP 16 -> 24：多留 8 条余量给浏览器的并发重连（每条 PCB 约 200 字节，
+#   收发缓冲按需分配，对 C5 的空闲堆影响在 2KB 量级）
+# 配套改动见 crid_web.c：客户端断开（只剩 0 个 station）时主动回收残留会话。
+CONFIG_LWIP_TCP_MSL=8000
+CONFIG_LWIP_MAX_ACTIVE_TCP=24
+
+# ---- lwIP TCP 接收窗口：不能超过 pbuf 池容量 ----
+# 上一版把窗口从 5760 提到 20480，理由是「窗口必须大于一个 TLS 记录」——**这个判断是错的**，
+# 已通过线刷新固件实测推翻：新固件上 64KB 分块依旧卡死。真正的原因是 mbedTLS 的
+# IN_CONTENT_LEN=4096 小于客户端的 16KB 记录（见上面那段注释），与 TCP 窗口无关。
+#
+# 窗口该多大，取决于 lwIP 的静态 pbuf 池，而池子不在堆里、heap 数字看不出来：
+#   ESP-IDF 没有暴露 PBUF_POOL_SIZE 的 Kconfig，走 lwIP 默认 16 个，
+#   每个约 PBUF_POOL_BUFSIZE ≈ TCP_MSS(1440) + 头部 ≈ 1476 B，总共约 23.6KB。
+#   窗口设 20KB 就要求一个连接吃下 14 个 pbuf，池子直接被榨干，
+#   连窗口更新/重传都要抢 pbuf —— 突发大块上传时必然零窗口且难以恢复。
+# 取值 8192：约 6 个 pbuf，留 10 个余量给并发连接与重传；
+#   8KB 窗口配 8KB 记录绰绰有余（记录本来只有 16KB 上限，靠多次窗口滚动发送）。
+# RECVMBOX 16：让 tcpip 线程能排队 16×1440≈23KB 的段，够一个窗口的突发。
+# SND_BUF 16384：下线方向（页面 gzip 100KB、CSV 导出）跑得动。
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384

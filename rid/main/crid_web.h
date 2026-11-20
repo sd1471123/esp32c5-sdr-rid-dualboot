@@ -1,0 +1,46 @@
+#ifndef CRID_WEB_H
+#define CRID_WEB_H
+
+#include "crid_config.h"
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief 启动内置配置网页服务器（http://192.168.4.1）
+ *
+ * 提供:
+ *   GET  /          配置页面（手机浏览器直接打开）
+ *   GET  /api/config 读取当前配置 (JSON)
+ *   POST /api/config 保存并应用配置 (JSON)，同时写入 NVS
+ *
+ * @param config 指向全局配置结构体（保存/应用均直接修改它）
+ * @return ESP_OK 成功
+ */
+esp_err_t crid_web_start(cn_crid_config_t *config);
+
+/**
+ * @brief 主动回收两台服务器上的全部客户端会话
+ *
+ * 手机断开热点后，设备侧收不到对方消失的通知，旧连接会继续占着 httpd 的
+ * 客户端槽与 lwIP 的 TCP PCB；重连后新连接排队，页面表现为「一直转圈、超时」。
+ * 事件回调与 web_guard_task 都会自动调用它，一般不需要手动调用。
+ */
+void crid_web_purge_sessions(void);
+
+/**
+ * @brief 取内置自签证书（PEM 文本，NUL 结尾）
+ *
+ * 设备自己用 https 回打本机 httpd 时，把它当作信任锚传给 esp_http_client。
+ * 证书是自签且 CA:TRUE、SAN 里带 192.168.4.1，正好能通过链校验；
+ * 不传的话 IDF 会直接报「No server verification option set」握手失败。
+ */
+const char *crid_web_cert_pem(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // CRID_WEB_H
