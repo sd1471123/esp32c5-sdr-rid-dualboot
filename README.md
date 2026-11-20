@@ -45,7 +45,7 @@ C5mix/
 │   ├── panel/         共用的 ST7789 + 5 按键 + 蜂鸣器驱动（原样取自 sdr tft 分支）
 │   └── dualboot/      启动目标切换 / OTA 状态确认
 ├── partitions/        合并后的 16MB 分区表（各工程各有一份拷贝）
-├── tools/             一键构建 / 烧录脚本、模拟截图生成（make_screenshots.py）
+├── tools/             构建 / 烧录脚本、模拟截图、发布打包（package_release.py）
 └── docs/              架构说明；docs/screens/ 是 README 用的模拟截图
 ```
 
@@ -161,13 +161,23 @@ C-RID 的网页配置入口（`https://192.168.4.1`）和 BLE 数据通道完全
 
 ## 构建与烧录
 
-需要 ESP-IDF **6.x**（本机为 `D:\esp-idf-v6.1`），且已装好 C5 工具链。脚本会自动剥离 MSYS 的
+**不想自己编译**：到 [Releases](https://github.com/sd1471123/esp32c5-sdr-rid-dualboot/releases) 下现成的镜像，一条命令烧完（会清空 NVS）：
+
+```bash
+python -m esptool --chip esp32c5 -p COM5 -b 460800 \
+    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.01-full-16mb.bin
+```
+
+同一页的 `...-parts.zip` 里是分体 bin 和一张 `FLASH.txt` 地址表，只想更新 C-RID 或想保留 NVS 设置时用；`SHA256SUMS.txt` 是校验和。
+
+自己编译需要 ESP-IDF **6.x**（本机为 `D:\esp-idf-v6.1`），且已装好 C5 工具链。脚本会自动剥离 MSYS 的
 `MSYSTEM` 变量，所以可以直接从 Git Bash 跑。
 
 ```bash
 # Git Bash：先设好 IDF_PATH / IDF_PYTHON_ENV_PATH，或先 source ESP-IDF 的 export.sh
 bash tools/build_all.sh
 bash tools/flash_all.sh -p COM6          # 整片烧录，会清 NVS
+python tools/package_release.py --version v0.02   # 出发布包：整片镜像 + 分体 zip + 校验和
 ```
 
 PowerShell：

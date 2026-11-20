@@ -1,0 +1,60 @@
+ESP32-C5 SDR + C-RID 双固件  {version}
+==================================
+
+芯片：ESP32-C5（16 MB Flash）
+bootloader 在 0x2000（C5 不是 0x0），不要按老习惯烧 0x0。
+
+文件
+----
+bootloader.bin          0x2000    二级 bootloader
+partition-table.bin     0x8000    合并后的 16 MB 分区表
+ota_data_initial.bin    0x10000   空的 otadata，保证开机进菜单
+launcher.bin            0x20000   开机二选一菜单（factory）
+sdr.bin                 0x120000  SDR 频谱仪（ota_0）
+rid_a.bin               0x320000  C-RID 固件 A（ota_1）
+rid_b.bin               0x620000  C-RID 固件 B（ota_2，网页 OTA 目标）
+
+
+方式一：整片镜像（推荐）
+------------------------
+下载 esp32c5-sdr-rid-dualboot-{version}-full-16mb.bin，一条命令写完 16 MB：
+
+  python -m esptool --chip esp32c5 -p COM5 -b 460800 \
+      write_flash 0x0 esp32c5-sdr-rid-dualboot-{version}-full-16mb.bin
+
+这会清空 NVS（设置恢复默认），适合第一次刷或想彻底重置。
+
+
+方式二：分体文件（只更新某一部分时用）
+--------------------------------------
+  python -m esptool --chip esp32c5 -p COM5 -b 460800 \
+      write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB \
+      0x2000  bootloader.bin \
+      0x8000  partition-table.bin \
+      0x10000 ota_data_initial.bin \
+      0x20000 launcher.bin \
+      0x120000 sdr.bin \
+      0x320000 rid_a.bin \
+      0x620000 rid_b.bin
+
+只想换 C-RID、保留 NVS 设置时，只烧 0x320000 和 0x620000 两个即可
+（两个槽位内容相同，保证网页 OTA 回滚时不会退回旧固件）。
+
+
+开机后
+------
+← 或 B      进 SDR 频谱仪
+→ 或 M      进 C-RID
+R           切换背光（10% / 100%）
+SDR 里 B+M 同时按住 1.5 秒，或 C-RID 里同样操作，回开机菜单。
+每次冷启动都会回到菜单，这是设计行为，不是没记住选择。
+
+
+注意
+----
+- 背光 BL 脚（GPIO23）不要直连 LED，必须用三极管/MOS 低边驱动。
+- 屏幕是 3.2 寸 240x320 ST7789（GMT032-8P-SPI），偏置 0/0、RGB565、
+  需要 0x21 反显。换屏请先看仓库 README 的「屏幕参数」一节。
+- 烧完若一直白屏或花屏，先把 SPI 降到 4 MHz 重试（杜邦线太长会导致）。
+
+许可证：GPL-3.0（仓库根 LICENSE）。esp-sdr 部分原始作者 sd1471123。
