@@ -31,6 +31,7 @@ SRC = os.path.join(ROOT, "main", "crid_web.c")
 DOC = os.path.join(ROOT, "docs", "model_db.md")
 INDEX = os.path.join(ROOT, "data", "faa_prefix_index_%s.tsv" % "2026-11-17")
 REVIEW = os.path.join(ROOT, "data", "models_reviewed_%s.tsv" % "2026-11-17")
+ANDROID = os.path.join(ROOT, "android", "app", "src", "main", "java", "com", "crid", "app", "data", "ModelNames.kt")
 SNAPSHOT_DATE = "2026-11-17"
 MIN_PREFIX = 5
 
@@ -226,7 +227,7 @@ CURATED = [
     ("其他厂商", "17444242", "WingtraOne Gen II", "WingtraOne Gen II", "官方区间 174442423~174449999"),
 ]
 
-GROUP_ORDER = ["消费级", "穿越机", "行业级", "植保", "物流", "其他厂商"]
+GROUP_ORDER = ["消费级", "穿越机", "行业级", "植保", "物流", "其他厂商", "电影级", "测绘级"]
 
 
 def validate(recs):
@@ -254,13 +255,23 @@ def validate(recs):
 # ---------------------------------------------------------------- 渲染
 def render_tokens():
     toks = ["const MDL=["]
+    extra = test_only()
+    bad = {(c[1], c[2]) for c in extra}
     for grp in GROUP_ORDER:
-        items = [c for c in CURATED if c[0] == grp]
+        items, seen = [], set()
+        for c in CURATED + extra:
+            if c[0] != grp:
+                continue
+            key = (c[1], c[2])
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((key[0], key[1], key in bad))
         if not items:
             continue
         toks.append("['%s',[" % grp)
-        for i, (_, px, disp, _, _) in enumerate(items):
-            toks.append("['%s','%s']" % (px, disp))
+        for i, (px, disp, flag) in enumerate(items):
+            toks.append("['%s','%s'%s]" % (px, disp, ",1" if flag else ""))
             if i != len(items) - 1:
                 toks.append(",")
         toks.append("]],")
@@ -283,6 +294,54 @@ def render_lines(width=98):
 
 def render_block():
     return "\n".join('"%s"' % l for l in render_lines())
+
+
+def model_items():
+    """返回 [(前缀, 机型名, 是否未核实)]，顺序与固件里的机型表一致。"""
+    extra = test_only()
+    bad = {(c[1], c[2]) for c in extra}
+    out, seen = [], set()
+    for grp in GROUP_ORDER:
+        for c in CURATED + extra:
+            if c[0] != grp:
+                continue
+            key = (c[1], c[2])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((key[0], key[1], key in bad))
+    return out
+
+
+def write_android():
+    rows = model_items()
+    body = "".join(
+        '        "%s" to ("%s" to %s),\n' % (px, name.replace('"', '\\"'), "true" if bad else "false")
+        for px, name, bad in rows)
+    text = (
+        "// 由 tools/models_faa.py --android 生成，请勿手改。\n"
+        "package com.crid.app.data\n\n"
+        "object ModelNames {\n"
+        "    // 序列号前缀 -> (机型名, 是否未核实)\n"
+        "    private val MAP: Map<String, Pair<String, Boolean>> = mapOf(\n"
+        + body +
+        "    )\n\n"
+        "    private val KEYS = MAP.keys.sortedByDescending { it.length }\n\n"
+        "    fun of(uid: String): Pair<String, Boolean>? {\n"
+        "        val u = uid.trim().uppercase()\n"
+        "        if (u.isEmpty()) return null\n"
+        "        for (k in KEYS) if (u.startsWith(k)) return MAP[k]\n"
+        "        return null\n"
+        "    }\n\n"
+        "    /** 未核实机型带 -?- 前缀；查不到时原样返回序列号。 */\n"
+        "    fun display(uid: String): String {\n"
+        "        val m = of(uid) ?: return uid\n"
+        "        return (if (m.second) \"-?-\" else \"\") + m.first\n"
+        "    }\n"
+        "}\n"
+    )
+    io.open(ANDROID, "w", encoding="utf-8", newline="\n").write(text)
+    print("已生成 %s（%d 条）" % (ANDROID, len(rows)))
 
 
 def find_block(src):
@@ -443,12 +502,46 @@ def draft_report(recs):
     return rows
 
 
+# ---------------------------------------------------------------- 未核实的测试条目
+# 第三方草稿库里 FAA 查无型号、或号段对不上的条目。它们没有官方依据，
+# 只用于自测发射与接收链路，所以把 "-?-" 加在机型名称前，便于与已核实型号区分；
+# 生成的 RID 序列号仍用草稿里的前缀（不额外加标记）。
+# 11223344 / 44332211 是肉眼可见的镜像编造号段，已剔除，不再加入。
+TEST_PREFIX = "-?-"
+TEST_SKIP = {"11223344", "44332211"}
+TEST_GROUP = {"消费级": "消费级", "穿越机/FPV": "穿越机", "行业级": "行业级",
+              "植保农业": "植保", "物流级": "物流",
+              "电影级": "电影级", "测绘级": "测绘级"}
+
+_test_cache = None
+
+
+def test_only():
+    """草稿库里未通过 FAA 核对、且官方表里没有同名机型的条目，进固件测试预设。
+
+    同名时只保留官方条目：测试条目仅在官方完全没有这个型号时才出现。
+    """
+    global _test_cache
+    if _test_cache is not None:
+        return _test_cache
+    official = {c[2] for c in CURATED}
+    out = []
+    for r in draft_report(parse_serial()):
+        if r["verdict"] == "已核实" or r["px"] in TEST_SKIP or r["name"] in official:
+            continue
+        grp = TEST_GROUP.get(r["sec"], "其他厂商")
+        out.append((grp, r["px"], r["name"], "", "未核实，仅接收端展示加标记"))
+    _test_cache = out
+    return out
+
+
 # ---------------------------------------------------------------- 主流程
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--doc", action="store_true")
+    ap.add_argument("--android", action="store_true")
     ap.add_argument("--suggest", action="store_true")
     ap.add_argument("--index", action="store_true")
     ap.add_argument("--review", action="store_true")
@@ -501,6 +594,8 @@ def main():
     if args.doc:
         write_doc(recs)
         print("已生成 %s" % DOC)
+    if args.android:
+        write_android()
     return 0
 
 
@@ -611,8 +706,9 @@ def write_doc(recs):
     A("| 单条序列号 | 取前 8 位，标记低置信 | `1587A540002APD` → `1587A540` |")
     A("| `RANGE` 起点 | 起点前 8 位作为合法截短（官方号段内更细的型号段） | `1748CHL7822390001` → `1748CHL7` |")
     A("")
-    A("反过来，下面这些一律不算，不进固件：官方没登记该型号、官方登记了型号但没有序列号、")
+    A("反过来，下面这些一律不算官方依据：官方没登记该型号、官方登记了型号但没有序列号、")
     A("把型号代号当序列号前缀（`SDR21V1`、`SR47PCV`）、「厂商码 + 000/001 递增」这类凭空构造。")
+    A("为了自测需要，这些条目仍以测试预设的形式收进固件（接收端展示时加 `-?-`，见第四、五节），但依然没有官方依据。")
     A("")
     A("## 二、结果")
     A("")
@@ -622,12 +718,13 @@ def write_doc(recs):
     A("| ⚠️ 第三方草稿库中前缀需修正 | %d |" % cnt.get("前缀需修正", 0))
     A("| ⚠️ 第三方草稿库中前缀可截短使用 | %d |" % cnt.get("前缀可截短", 0))
     A("| ❌ 官方无该型号登记 | %d |" % cnt.get("官方无登记", 0))
+    A("| 🧪 未核实，接收端展示加 `-?-` | %d |" % len(test_only()))
     A("")
     A("草稿库共 %d 条：%d 条与官方完全一致，%d 条前缀需替换为官方值，%d 条前缀可截短，%d 条查无此型号。"
       % (len(rep), cnt.get("已核实", 0), cnt.get("前缀需修正", 0),
          cnt.get("前缀可截短", 0), cnt.get("官方无登记", 0)))
     A("")
-    A("## 三、已核实清单（固件当前使用的全部条目）")
+    A("## 三、已核实清单（有官方依据的条目）")
     A("")
     for grp in GROUP_ORDER:
         items = [c for c in CURATED if c[0] == grp]
@@ -646,10 +743,13 @@ def write_doc(recs):
                 shown = "—"
             A("| `%s` | %s | %s | `%s` | %s |" % (px, disp, official, shown, note or ""))
         A("")
+    A("另有 %d 条没有官方依据的条目，已作为测试预设加入固件（接收端展示时加 `-?-`），逐条见第四、五节。"
+      % len(test_only()))
+    A("")
     A("## 四、第三方草稿库逐条核对")
     A("")
     A("`data/models_draft_2026-11-11.txt`（108 条）与官方序列号逐条比对。**「前缀需修正」的条目，"
-      "草稿里的前缀在官方数据里找不到任何出处**，用它会生成查无此机的序列号。")
+      "草稿里的前缀在官方数据里找不到任何出处**，用它会生成查无此机的序列号（现已作为测试预设加入固件，接收端展示时加 `-?-`）。")
     A("")
     A("| 分类 | 草稿前缀 | 草稿型号 | 官方前缀 | 官方型号 | 判定 |")
     A("| --- | --- | --- | --- | --- | --- |")
@@ -659,19 +759,23 @@ def write_doc(recs):
         A("| %s | `%s` | %s | `%s` | %s | %s |"
           % (r["sec"], r["px"], r["name"], r["off"], r["official"], r["verdict"]))
     A("")
-    A("## 五、官方清单中不存在的型号（UNVERIFIED）")
+    A("## 五、官方清单中不存在的型号（已加入测试预设，接收端展示带 `-?-`）")
     A("")
-    A("这些条目只保留在文档里备查，**不进固件、不参与任何匹配**。缺失原因多为该机型未在美国登记 DoC，")
-    A("不代表机器不存在，但在拿到官方依据前不应给它们编前缀。")
+    A("这些条目没有官方序列号依据，只用于自测发射与接收链路。固件把它们收进测试预设；")
+    A("**接收端展示时**若收到的序列号命中这些前缀，会在机型名前加 `-?-`（例如 `-?-Mini 2 SE`），")
+    A("发射端的机型名称输入框与预设下拉框保持原样，**不代表该机型真实存在或已通过认证**。")
+    A("`11223344`、`44332211` 是肉眼可见的镜像编造号段，已剔除。")
     A("")
-    A("| 分类 | 草稿前缀 | 型号 | 说明 |")
-    A("| --- | --- | --- | --- |")
+    A("| 分类 | 草稿前缀 | 型号 | 接收端展示 | 说明 |")
+    A("| --- | --- | --- | --- | --- |")
     whys = {u[1]: u[3] for u in UNVERIFIED}
     for r in rep:
         if r["verdict"] != "官方无登记":
             continue
-        A("| %s | `%s` | %s | %s |" % (r["sec"], r["px"], r["name"],
-                                       whys.get(r["px"], "官方清单无此型号的可匹配记录")))
+        if r["px"] in TEST_SKIP:
+            continue
+        A("| %s | `%s` | %s | `-?-%s` | %s |" % (r["sec"], r["px"], r["name"], r["name"],
+                                                whys.get(r["px"], "官方清单无此型号的可匹配记录")))
     A("")
     A("## 六、共用一个前缀的情况")
     A("")

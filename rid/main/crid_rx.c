@@ -17,6 +17,7 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "esp_log.h"
+#include "buzzer.h"
 #include "opendroneid.h"
 #include <string.h>
 #include <time.h>
@@ -88,6 +89,7 @@ typedef struct {
 
 static QueueHandle_t s_queue = NULL;
 static TaskHandle_t  s_task = NULL;
+static TaskHandle_t  s_buzz_task = NULL;
 static volatile bool s_running = false;
 
 static rx_track_t s_tracks[CRID_RX_MAX_TRACKS];
@@ -436,6 +438,33 @@ static void maybe_log(rx_track_t *t) {
 }
 
 /* ================================================================
+ * RX 扫描提示音：每个扫描刷新周期（2 秒，与网页 /api/rx 轮询一致）
+ * 按当前在线无人机数量响 1 / 2 / 3 声（>=3 统一 3 声）。
+ * 静音由 buzzer_play() 内部的 buzz_enabled 统一处理，无需额外判断。
+ * ================================================================ */
+static void rx_buzz_task(void *pv) {
+    (void)pv;
+    while (s_running) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (!s_running) break;
+
+        int online = 0;
+        uint32_t now = esp_log_timestamp();
+        for (int i = 0; i < CRID_RX_MAX_TRACKS; i++) {
+            rx_track_t *t = &s_tracks[i];
+            if (t->active && (now - t->last_seen_ms) <= 10000) online++;
+        }
+        if (online <= 0) continue;              // 没有在线目标不响
+
+        if (online >= 3)      buzzer_play(UI_BUZZ_RX_3);
+        else if (online == 2) buzzer_play(UI_BUZZ_RX_2);
+        else                  buzzer_play(UI_BUZZ_RX_1);
+    }
+    s_buzz_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ================================================================
  * 解析任务：出队 -> 定位航迹 -> 解码 -> 更新
  * ================================================================ */
 
@@ -611,6 +640,12 @@ esp_err_t crid_rx_start(uint8_t listen_channel) {
         return ESP_ERR_NO_MEM;
     }
 
+    // 扫描提示音任务：2 秒一次按在线无人机数量响 1/2/3 声
+    if (xTaskCreate(rx_buzz_task, "crid_rx_buzz", 2048, NULL, 4, &s_buzz_task) != pdPASS) {
+        ESP_LOGW(TAG, "创建 RX 提示音任务失败，扫描提示音不可用");
+        s_buzz_task = NULL;
+    }
+
     ESP_LOGI(TAG, "接收模式启动: 监听信道 %u", listen_channel);
     return ESP_OK;
 }
@@ -620,12 +655,14 @@ void crid_rx_stop(void) {
     s_running = false;
     esp_wifi_set_promiscuous(false);
 
-    // 等解析任务自行退出（最多 1s）
-    for (int i = 0; i < 20 && s_task != NULL; i++) {
-        if (eTaskGetState(s_task) == eDeleted || eTaskGetState(s_task) == eInvalid) break;
+    // 等解析任务与提示音任务自行退出（最多 1s）
+    for (int i = 0; i < 20 && (s_task != NULL || s_buzz_task != NULL); i++) {
+        if ((s_task == NULL || eTaskGetState(s_task) == eDeleted || eTaskGetState(s_task) == eInvalid) &&
+            (s_buzz_task == NULL || eTaskGetState(s_buzz_task) == eDeleted || eTaskGetState(s_buzz_task) == eInvalid)) break;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     s_task = NULL;
+    s_buzz_task = NULL;
 
     if (s_queue) {
         vQueueDelete(s_queue);
