@@ -20,6 +20,11 @@ static const uint16_t pat_top[] = {30, 0};
 static const uint16_t pat_bottom[] = {30, 30, 30, 0};
 static const uint16_t pat_countdown[] = {30, 0};
 static const uint16_t pat_reset[] = {80, 80, 80, 80, 80, 0};
+/* RX 扫描提示：每声 60ms on / 60ms off，连续 N 声后以 0 结束。
+ * 用低优先级 0，按键/复位等交互音（>=1）可抢占，不会被提示音拖住。 */
+static const uint16_t pat_rx_1[] = {60, 0};
+static const uint16_t pat_rx_2[] = {60, 60, 60, 0};
+static const uint16_t pat_rx_3[] = {60, 60, 60, 60, 60, 0};
 
 static const buzz_pattern_t patterns[UI_BUZZ_COUNT] = {
     [UI_BUZZ_BOOT] = {pat_boot, 0},
@@ -30,6 +35,9 @@ static const buzz_pattern_t patterns[UI_BUZZ_COUNT] = {
     [UI_BUZZ_BOTTOM] = {pat_bottom, 0},
     [UI_BUZZ_COUNTDOWN] = {pat_countdown, 0},
     [UI_BUZZ_RESET] = {pat_reset, 2},
+    [UI_BUZZ_RX_1] = {pat_rx_1, 0},
+    [UI_BUZZ_RX_2] = {pat_rx_2, 0},
+    [UI_BUZZ_RX_3] = {pat_rx_3, 0},
 };
 
 static QueueHandle_t buzz_queue;

@@ -14,8 +14,9 @@
 | 单条序列号 | 取前 8 位，标记低置信 | `1587A540002APD` → `1587A540` |
 | `RANGE` 起点 | 起点前 8 位作为合法截短（官方号段内更细的型号段） | `1748CHL7822390001` → `1748CHL7` |
 
-反过来，下面这些一律不算，不进固件：官方没登记该型号、官方登记了型号但没有序列号、
+反过来，下面这些一律不算官方依据：官方没登记该型号、官方登记了型号但没有序列号、
 把型号代号当序列号前缀（`SDR21V1`、`SR47PCV`）、「厂商码 + 000/001 递增」这类凭空构造。
+为了自测需要，这些条目仍以测试预设的形式收进固件（接收端展示时加 `-?-`，见第四、五节），但依然没有官方依据。
 
 ## 二、结果
 
@@ -25,10 +26,11 @@
 | ⚠️ 第三方草稿库中前缀需修正 | 21 |
 | ⚠️ 第三方草稿库中前缀可截短使用 | 5 |
 | ❌ 官方无该型号登记 | 23 |
+| 🧪 未核实，接收端展示加 `-?-` | 32 |
 
 草稿库共 108 条：59 条与官方完全一致，21 条前缀需替换为官方值，5 条前缀可截短，23 条查无此型号。
 
-## 三、已核实清单（固件当前使用的全部条目）
+## 三、已核实清单（有官方依据的条目）
 
 ### 消费级（19 条）
 
@@ -150,9 +152,11 @@
 | `1701DGAS` | Percepto AirMax OGI | AirMax OGI | `1701DGAS00000000PR-1701DGASXXXXXXXXPR（区间）` |  |
 | `17444242` | WingtraOne Gen II | WingtraOne Gen II | `174442423-174449999（区间）` | 官方区间 174442423~174449999 |
 
+另有 32 条没有官方依据的条目，已作为测试预设加入固件（接收端展示时加 `-?-`），逐条见第四、五节。
+
 ## 四、第三方草稿库逐条核对
 
-`data/models_draft_2026-11-11.txt`（108 条）与官方序列号逐条比对。**「前缀需修正」的条目，草稿里的前缀在官方数据里找不到任何出处**，用它会生成查无此机的序列号。
+`data/models_draft_2026-11-11.txt`（108 条）与官方序列号逐条比对。**「前缀需修正」的条目，草稿里的前缀在官方数据里找不到任何出处**，用它会生成查无此机的序列号（现已作为测试预设加入固件，接收端展示时加 `-?-`）。
 
 | 分类 | 草稿前缀 | 草稿型号 | 官方前缀 | 官方型号 | 判定 |
 | --- | --- | --- | --- | --- | --- |
@@ -183,36 +187,38 @@
 | 测绘级 | `1587A002` | eBee Geo | `1587A051、1587A540` | eBee X series | 前缀需修正 |
 | 测绘级 | `1688W000` | WingtraOne Gen II | `17444、17444242` | WingtraOne Gen II | 前缀需修正 |
 
-## 五、官方清单中不存在的型号（UNVERIFIED）
+## 五、官方清单中不存在的型号（已加入测试预设，接收端展示带 `-?-`）
 
-这些条目只保留在文档里备查，**不进固件、不参与任何匹配**。缺失原因多为该机型未在美国登记 DoC，
-不代表机器不存在，但在拿到官方依据前不应给它们编前缀。
+这些条目没有官方序列号依据，只用于自测发射与接收链路。固件把它们收进测试预设；
+**接收端展示时**若收到的序列号命中这些前缀，会在机型名前加 `-?-`（例如 `-?-Mini 2 SE`），
+发射端的机型名称输入框与预设下拉框保持原样，**不代表该机型真实存在或已通过认证**。
+`11223344`、`44332211` 是肉眼可见的镜像编造号段，已剔除。
 
-| 分类 | 草稿前缀 | 型号 | 说明 |
-| --- | --- | --- | --- |
-| 消费级 | `1581F6CD` | Mini 2 SE | DJI 未登记该型号的 DoC |
-| 消费级 | `1581F8PJ` | Mini 4K | DJI 未登记该型号的 DoC |
-| 消费级 | `1581FB34` | Lito X1 | 无任何厂商登记 |
-| 消费级 | `1581FBV5` | Lito 1 | 无任何厂商登记 |
-| 消费级 | `1778S000` | SplashDrone 4 | SwellPro 未登记该型号 |
-| 消费级 | `PF723000` | Rolling Spider | Parrot 未登记 |
-| 消费级 | `PF727078` | Mambo FLY | Parrot 未登记 |
-| 消费级 | `YUNQ4KPUS` | Q500 4K Typhoon | Yuneec 全品牌未登记 |
-| 穿越机/FPV | `1581F7V2` | Flip | DJI 未登记该型号的 DoC |
-| 穿越机/FPV | `1581F87L` | Neo | DJI 未登记该型号的 DoC |
-| 穿越机/FPV | `1581FA6Q` | Neo 2 | DJI 未登记该型号的 DoC |
-| 行业级 | `1701A000` | Percepto Max | 官方型号是 AirMax / OGI |
-| 行业级 | `1701A001` | Percepto Sparrow | 官方只有 AirMax / OGI |
-| 行业级 | `1701A002` | Percepto Air | 官方只有 AirMax / OGI |
-| 行业级 | `YUNH5ETWET` | H520 Hexacopter | Yuneec 未登记 |
-| 行业级 | `YUNH920202EU` | Tornado H920 | Yuneec 未登记 |
-| 行业级 | `YUNTYH3EU` | Typhoon H3 | Yuneec 未登记 |
-| 植保农业 | `1581FAE3` | Agras T70S | DJI 只登记 T70P |
-| 植保农业 | `1758X003` | V40 | XAG 无该型号（有 P60 / P100 / P150） |
-| 电影级 | `18179000` | Alta X | Freefly 登记了型号但无序列号 |
-| 电影级 | `18179002` | Alta 8 | Freefly 未登记 |
-| 测绘级 | `1587A003` | eBee RTK | 官方 eBee X series 不含 RTK |
-| 测绘级 | `1688W001` | WingtraOne GEN I | Wingtra 只登记 Gen II / RAY |
+| 分类 | 草稿前缀 | 型号 | 接收端展示 | 说明 |
+| --- | --- | --- | --- | --- |
+| 消费级 | `1581F6CD` | Mini 2 SE | `-?-Mini 2 SE` | DJI 未登记该型号的 DoC |
+| 消费级 | `1581F8PJ` | Mini 4K | `-?-Mini 4K` | DJI 未登记该型号的 DoC |
+| 消费级 | `1581FB34` | Lito X1 | `-?-Lito X1` | 无任何厂商登记 |
+| 消费级 | `1581FBV5` | Lito 1 | `-?-Lito 1` | 无任何厂商登记 |
+| 消费级 | `1778S000` | SplashDrone 4 | `-?-SplashDrone 4` | SwellPro 未登记该型号 |
+| 消费级 | `PF723000` | Rolling Spider | `-?-Rolling Spider` | Parrot 未登记 |
+| 消费级 | `PF727078` | Mambo FLY | `-?-Mambo FLY` | Parrot 未登记 |
+| 消费级 | `YUNQ4KPUS` | Q500 4K Typhoon | `-?-Q500 4K Typhoon` | Yuneec 全品牌未登记 |
+| 穿越机/FPV | `1581F7V2` | Flip | `-?-Flip` | DJI 未登记该型号的 DoC |
+| 穿越机/FPV | `1581F87L` | Neo | `-?-Neo` | DJI 未登记该型号的 DoC |
+| 穿越机/FPV | `1581FA6Q` | Neo 2 | `-?-Neo 2` | DJI 未登记该型号的 DoC |
+| 行业级 | `1701A000` | Percepto Max | `-?-Percepto Max` | 官方型号是 AirMax / OGI |
+| 行业级 | `1701A001` | Percepto Sparrow | `-?-Percepto Sparrow` | 官方只有 AirMax / OGI |
+| 行业级 | `1701A002` | Percepto Air | `-?-Percepto Air` | 官方只有 AirMax / OGI |
+| 行业级 | `YUNH5ETWET` | H520 Hexacopter | `-?-H520 Hexacopter` | Yuneec 未登记 |
+| 行业级 | `YUNH920202EU` | Tornado H920 | `-?-Tornado H920` | Yuneec 未登记 |
+| 行业级 | `YUNTYH3EU` | Typhoon H3 | `-?-Typhoon H3` | Yuneec 未登记 |
+| 植保农业 | `1581FAE3` | Agras T70S | `-?-Agras T70S` | DJI 只登记 T70P |
+| 植保农业 | `1758X003` | V40 | `-?-V40` | XAG 无该型号（有 P60 / P100 / P150） |
+| 电影级 | `18179000` | Alta X | `-?-Alta X` | Freefly 登记了型号但无序列号 |
+| 电影级 | `18179002` | Alta 8 | `-?-Alta 8` | Freefly 未登记 |
+| 测绘级 | `1587A003` | eBee RTK | `-?-eBee RTK` | 官方 eBee X series 不含 RTK |
+| 测绘级 | `1688W001` | WingtraOne GEN I | `-?-WingtraOne GEN I` | Wingtra 只登记 Gen II / RAY |
 
 ## 六、共用一个前缀的情况
 

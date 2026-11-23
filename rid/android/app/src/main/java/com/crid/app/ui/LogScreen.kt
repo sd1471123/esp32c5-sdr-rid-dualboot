@@ -1,13 +1,19 @@
 package com.crid.app.ui
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -16,11 +22,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
@@ -37,6 +46,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -51,6 +61,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.crid.app.data.LogInfo
 import com.crid.app.data.LogPoint
 import com.crid.app.data.LogTarget
+import com.crid.app.data.ModelNames
 import com.crid.app.data.UiState
 import com.crid.app.ui.theme.CridDark
 import com.crid.app.ui.theme.CridGreen
@@ -75,6 +86,8 @@ private const val MAX_PAGES = 10
 fun LogScreen(vm: AppViewModel, state: UiState) {
     var selected by remember { mutableStateOf<LogTarget?>(null) }
     if (selected != null) {
+        // 系统返回键 / 手势回到列表，而不是直接退出 App
+        BackHandler { selected = null }
         LogDetail(vm, selected!!) { selected = null }
     } else {
         LogList(vm, state) { selected = it }
@@ -206,9 +219,11 @@ private fun LogList(vm: AppViewModel, state: UiState, onOpen: (LogTarget) -> Uni
         }
 
         items(info?.targets.orEmpty(), key = { it.mac }) { target ->
-            SectionCard(target.uid.ifBlank { target.mac }) {
+            val name = ModelNames.display(target.uid).ifBlank { target.mac }
+            SectionCard(name) {
                 Text(
-                    target.mac + " · " + target.count + " 条",
+                    (if (target.uid.isNotBlank() && name != target.uid) target.uid + " · " else "") +
+                        target.mac + " · " + target.count + " 条",
                     fontSize = 11.sp,
                     fontFamily = FontFamily.Monospace,
                     color = CridGrey,
@@ -289,6 +304,8 @@ private fun LogDetail(vm: AppViewModel, target: LogTarget, onBack: () -> Unit) {
     var idx by remember { mutableIntStateOf(0) }
     var playing by remember { mutableStateOf(false) }
     var rate by remember { mutableIntStateOf(1) }
+    val context = LocalContext.current
+    val name = ModelNames.display(target.uid).ifBlank { target.mac }
 
     LaunchedEffect(target.mac) {
         loading = true
@@ -323,16 +340,49 @@ private fun LogDetail(vm: AppViewModel, target: LogTarget, onBack: () -> Unit) {
             .fillMaxSize()
             .padding(12.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← 返回列表") }
-            Text(
-                target.uid.ifBlank { target.mac },
-                Modifier.weight(1f),
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = CridDark,
-                maxLines = 1,
-            )
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(Color(0xFFF6F8FA), RoundedCornerShape(10.dp))
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { onBack() }
+                    .padding(start = 8.dp, end = 10.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "返回列表",
+                    tint = CridDark,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    "返回列表",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = CridDark,
+                    modifier = Modifier.padding(start = 2.dp),
+                )
+            }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    name,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = CridDark,
+                    maxLines = 1,
+                )
+                Text(
+                    (if (target.uid.isNotBlank() && name != target.uid) "序列号 " + target.uid + " · " else "") +
+                        "轨迹回放 · ${target.count} 条记录",
+                    fontSize = 10.sp,
+                    color = CridGrey,
+                )
+            }
             if (loading) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
         }
 
@@ -362,24 +412,33 @@ private fun LogDetail(vm: AppViewModel, target: LogTarget, onBack: () -> Unit) {
                     .fillMaxWidth()
                     .padding(top = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Button(onClick = { playing = !playing }, modifier = Modifier.weight(1f)) {
-                    Text(if (playing) "暂停" else "播放", fontSize = 12.sp)
+                Button(
+                    onClick = { playing = !playing },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        if (playing) "暂停" else "播放",
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
                 }
                 OutlinedButton(
                     onClick = {
                         playing = false
                         idx = 0
                     },
-                    modifier = Modifier.weight(1f),
-                ) { Text("重置", fontSize = 12.sp) }
-                Text("速度", fontSize = 11.sp, color = CridGrey)
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                ) { Text("重置", fontSize = 12.sp, maxLines = 1, softWrap = false) }
+                Spacer(Modifier.weight(1f))
+                Text("速度", fontSize = 11.sp, color = CridGrey, maxLines = 1)
                 listOf(1, 2, 4).forEach { r ->
                     FilterChip(
                         selected = rate == r,
                         onClick = { rate = r },
-                        label = { Text("${r}x", fontSize = 11.sp) },
+                        label = { Text("${r}x", fontSize = 11.sp, maxLines = 1) },
                     )
                 }
             }
@@ -396,13 +455,20 @@ private fun LogDetail(vm: AppViewModel, target: LogTarget, onBack: () -> Unit) {
 
             val p = points.getOrNull(idx)
             if (p != null) {
-                Text(
-                    "${fmtPointTime(p)} · ${fmt6(p.lat)}, ${fmt6(p.lon)} · 高 ${fmt1(p.alt)}m · " +
-                        "${fmt1(p.spd_h)}m/s · ${fmt1(p.track)}° · ${p.rssi}dBm",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = CridGreen,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${fmtPointTime(p)} · ${fmt6(p.lat)}, ${fmt6(p.lon)} · 高 ${fmt1(p.alt)}m · " +
+                            "${fmt1(p.spd_h)}m/s · ${fmt1(p.track)}° · ${p.rssi}dBm",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = CridGreen,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { openNavigation(context, p.lat, p.lon, name) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    ) { Text("导航", fontSize = 11.sp, maxLines = 1, softWrap = false) }
+                }
             }
 
             val pathPage = idx / PER_PAGE
@@ -522,6 +588,23 @@ private fun fmtPointTime(p: LogPoint): String =
 private fun kbText(bytes: Long): String =
     if (bytes >= 1024 * 1024) String.format(java.util.Locale.US, "%.1fMB", bytes / 1048576.0)
     else "${bytes / 1024}KB"
+
+/** 调起地图/导航应用定位到该点；没有支持 geo: 的应用时退回高德网页（WGS84 坐标）。 */
+private fun openNavigation(context: Context, lat: Double, lon: Double, label: String) {
+    val name = Uri.encode(label)
+    try {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=$lat,$lon($name)")))
+        return
+    } catch (_: ActivityNotFoundException) {
+    }
+    try {
+        val web = "https://uri.amap.com/marker?position=$lon,$lat&name=$name" +
+            "&coordinate=wgs84&callnative=1"
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(web)))
+    } catch (_: Exception) {
+        Toast.makeText(context, "未找到可用的地图应用", Toast.LENGTH_SHORT).show()
+    }
+}
 
 private fun shareFile(context: Context, file: java.io.File) {
     try {
