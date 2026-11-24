@@ -438,21 +438,28 @@ static void maybe_log(rx_track_t *t) {
 }
 
 /* ================================================================
- * RX 扫描提示音：每个扫描刷新周期（2 秒，与网页 /api/rx 轮询一致）
- * 按当前在线无人机数量响 1 / 2 / 3 声（>=3 统一 3 声）。
+ * RX 扫描提示音：跟随刷新节奏（1 秒，与网页 /api/rx 轮询、LCD 目标页一致）。
+ * 只有这一轮真的解码到新报文才响，按最近 2 秒内仍在刷新的目标数响 1 / 2 / 3 声
+ * （>=3 统一 3 声）；无人机停发后没有新报文，提示音随之停止。
  * 静音由 buzzer_play() 内部的 buzz_enabled 统一处理，无需额外判断。
  * ================================================================ */
 static void rx_buzz_task(void *pv) {
     (void)pv;
+    uint32_t last_ok = s_parse_ok;
     while (s_running) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         if (!s_running) break;
+
+        /* 解码计数没变：这一轮没有新报文，不算刷新，不响 */
+        uint32_t ok = s_parse_ok;
+        if (ok == last_ok) continue;
+        last_ok = ok;
 
         int online = 0;
         uint32_t now = esp_log_timestamp();
         for (int i = 0; i < CRID_RX_MAX_TRACKS; i++) {
             rx_track_t *t = &s_tracks[i];
-            if (t->active && (now - t->last_seen_ms) <= 10000) online++;
+            if (t->active && (now - t->last_seen_ms) <= 2000) online++;
         }
         if (online <= 0) continue;              // 没有在线目标不响
 
@@ -640,7 +647,7 @@ esp_err_t crid_rx_start(uint8_t listen_channel) {
         return ESP_ERR_NO_MEM;
     }
 
-    // 扫描提示音任务：2 秒一次按在线无人机数量响 1/2/3 声
+    // 扫描提示音任务：跟随 1 秒刷新，有新报文才按在线无人机数量响 1/2/3 声
     if (xTaskCreate(rx_buzz_task, "crid_rx_buzz", 2048, NULL, 4, &s_buzz_task) != pdPASS) {
         ESP_LOGW(TAG, "创建 RX 提示音任务失败，扫描提示音不可用");
         s_buzz_task = NULL;
