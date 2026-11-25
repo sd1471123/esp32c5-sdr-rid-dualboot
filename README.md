@@ -1,5 +1,14 @@
 # ESP32-C5 双固件项目：SDR 频谱仪 + C-RID 远程识别（ST7789 320×240 + 5 键）
 
+## 实物图
+
+实机拍摄的照片（模拟渲染图见下面「界面预览」）：
+
+| 手持成品 | 裸板 |
+|---|---|
+| <img src="docs/photos/device-handheld.png" width="280" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-board.png" width="420" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
+| 3D打印外壳 + 双频天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | ESP32-C5 + 3.2" ST7789 + 5 个按键，背后是主控板，转3.3V模块负责给主控板和屏幕供电，转5V充放电一体模块可给其他设备充电，配5000毫安21700电池 |
+
 **硬件**：ESP32-C5（16 MB Flash）· 3.2" ST7789 240×320 SPI 屏（横屏使用）· 5 个按键 · 蜂鸣器
 
 把两个项目合成**一个可烧录的 16 MB 镜像**，开机用同一块 ST7789 屏和 5 个按键选择进入哪套固件：
@@ -59,15 +68,6 @@
 ```bash
 python tools/make_screenshots.py --scale 2
 ```
-
-## 实物图
-
-上面是渲染图，这两张是实机拍摄：
-
-| 手持成品 | 裸板 |
-|---|---|
-| <img src="docs/photos/device-handheld.png" width="280" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-board.png" width="420" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
-| 3D打印外壳 + 双频天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | ESP32-C5 + 3.2" ST7789 + 5 个按键，背后是主控板，转3.3V模块负责给主控板和屏幕供电，转5V充放电一体模块可给其他设备充电，配5000毫安21700电池 |
 
 ## 目录
 
