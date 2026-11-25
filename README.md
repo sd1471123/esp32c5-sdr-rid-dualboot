@@ -60,6 +60,15 @@
 python tools/make_screenshots.py --scale 2
 ```
 
+## 实物图
+
+上面是渲染图，这两张是实机拍摄：
+
+| 手持成品 | 裸板 |
+|---|---|
+| <img src="docs/photos/device-handheld.png" width="280" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-board.png" width="420" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
+| 蓝色外壳 + 5.8 GHz 天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | ESP32-C5 + 3.2" ST7789 + 5 个按键，排针在屏幕下方 |
+
 ## 目录
 
 ```
@@ -72,7 +81,7 @@ C5mix/
 │   └── dualboot/      启动目标切换 / OTA 状态确认
 ├── partitions/        合并后的 16MB 分区表（各工程各有一份拷贝）
 ├── tools/             构建 / 烧录脚本、模拟截图、发布打包（package_release.py）
-└── docs/              架构说明；docs/screens/ 是 README 用的模拟截图
+└── docs/              架构说明；docs/screens/ 是模拟截图，docs/photos/ 是实机照片
 ```
 
 源码基线：
