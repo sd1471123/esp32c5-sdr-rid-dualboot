@@ -67,7 +67,7 @@ python tools/make_screenshots.py --scale 2
 | 手持成品 | 裸板 |
 |---|---|
 | <img src="docs/photos/device-handheld.png" width="280" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-board.png" width="420" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
-| 蓝色外壳 + 5.8 GHz 天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | ESP32-C5 + 3.2" ST7789 + 5 个按键，排针在屏幕下方 |
+| 3D打印外壳 + 双频天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | ESP32-C5 + 3.2" ST7789 + 5 个按键，背后是主控板，转3.3V模块负责给主控板和屏幕供电，转5V充放电一体模块可给其他设备充电，配5000毫安21700电池 |
 
 ## 目录
 
