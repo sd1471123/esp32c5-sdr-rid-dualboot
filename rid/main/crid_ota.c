@@ -10,7 +10,8 @@
  *  2. 只写「另一个」app 分区（esp_ota_get_next_update_partition），
  *     写完 esp_ota_end 校验（镜像头、芯片 ID、SHA256）通过后才切换启动项，
  *     中途断电/断网只会留下一个写坏的备份分区，重启永远回旧固件。
- *  3. 4KB 静态缓冲：httpd 任务栈默认只有 4KB，绝不能在栈上开大数组。
+ *  3. 4KB 上传缓冲不进栈也不常驻：httpd 任务栈默认只有 4KB，绝不能在栈上开大数组；
+ *     这块缓冲只在上传期间按需分配，传完立即释放。
  *  4. 顺序擦写（OTA_WITH_SEQUENTIAL_WRITES）：边收边擦，不用先花十几秒
  *     把 2MB 分区整体擦完才开始收数据，手机端不会误以为「卡死」。
  *  5. 上传令牌（每次上电随机）：只为挡住手机同时连着热点与移动数据时，
@@ -20,6 +21,7 @@
 #include "crid_ota.h"
 
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -41,7 +43,6 @@ static const char *TAG = "CN_C-RID_OTA";
 // 无限重试会让 httpd 任务永远卡在这个请求上
 #define OTA_MAX_TIMEOUTS 8
 
-static char s_chunk[OTA_CHUNK];
 static char s_token[9];   // 8 位十六进制 + '\0'
 
 // 上传进行中标志：会话回收任务据此避开正在写入的这个连接。
@@ -127,11 +128,18 @@ static esp_err_t ota_upload_body(httpd_req_t *req) {
         return ota_fail(req, "400 Bad Request", "文件超过 OTA 分区容量");
     }
 
+    // ---- 3.5 上传缓冲：只在上传期间占 4KB，结束立即归还 ----
+    char *chunk = (char *)heap_caps_malloc(OTA_CHUNK, MALLOC_CAP_8BIT);
+    if (chunk == NULL) {
+        return ota_fail(req, "500 Internal Server Error", "内存不足，无法开始升级");
+    }
+
     // ---- 4. 开始写入 ----
     esp_ota_handle_t handle = 0;
     esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        free(chunk);
         // 回滚已开启时，本次运行固件还没被确认（PENDING_VERIFY）会走到这里
         return ota_fail(req, "500 Internal Server Error",
                         err == ESP_ERR_OTA_ROLLBACK_INVALID_STATE
@@ -143,11 +151,12 @@ static esp_err_t ota_upload_body(httpd_req_t *req) {
     int timeouts = 0;
     while (writ < total) {
         int want = (total - writ) > OTA_CHUNK ? OTA_CHUNK : (int)(total - writ);
-        int got = httpd_req_recv(req, s_chunk, want);
+        int got = httpd_req_recv(req, chunk, want);
 
         if (got == HTTPD_SOCK_ERR_TIMEOUT) {
             if (++timeouts > OTA_MAX_TIMEOUTS) {
                 esp_ota_abort(handle);
+                free(chunk);
                 ESP_LOGE(TAG, "recv timeout x%d, aborted at %u/%u", timeouts, (unsigned)writ, (unsigned)total);
                 return ota_fail(req, "408 Request Timeout", "传输超时，已取消升级，旧固件不受影响");
             }
@@ -155,14 +164,16 @@ static esp_err_t ota_upload_body(httpd_req_t *req) {
         }
         if (got <= 0) {
             esp_ota_abort(handle);
+            free(chunk);
             ESP_LOGE(TAG, "recv failed at %u/%u", (unsigned)writ, (unsigned)total);
             return ESP_FAIL;   // socket 已断，回包也没人收
         }
         timeouts = 0;
 
-        err = esp_ota_write(handle, s_chunk, got);
+        err = esp_ota_write(handle, chunk, got);
         if (err != ESP_OK) {
             esp_ota_abort(handle);
+            free(chunk);
             ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
             return ota_fail(req, "400 Bad Request",
                             err == ESP_ERR_OTA_VALIDATE_FAILED
@@ -179,6 +190,7 @@ static esp_err_t ota_upload_body(httpd_req_t *req) {
     err = esp_ota_end(handle);   // 校验 SHA256 / 芯片 ID，失败说明镜像有问题
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        free(chunk);
         return ota_fail(req, "400 Bad Request",
                         err == ESP_ERR_OTA_VALIDATE_FAILED
                             ? "固件校验失败（芯片型号不匹配或文件损坏）"
@@ -187,6 +199,7 @@ static esp_err_t ota_upload_body(httpd_req_t *req) {
     err = esp_ota_set_boot_partition(part);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "set_boot_partition failed: %s", esp_err_to_name(err));
+        free(chunk);
         return ota_fail(req, "500 Internal Server Error", "切换启动分区失败");
     }
 
@@ -196,7 +209,12 @@ static esp_err_t ota_upload_body(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
 
-    ESP_LOGW(TAG, "OTA success: %u bytes -> %s", (unsigned)writ, part->label);
+    ESP_LOGW(TAG, "OTA success: %u bytes -> %s (heap=%u hmin=%u hblk=%u)",
+             (unsigned)writ, part->label,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    free(chunk);
     return ESP_OK;
 }
 

@@ -546,6 +546,55 @@ def rid_edit() -> Screen:
     return s
 
 
+def rid_radar() -> Screen:
+    s = Screen()
+    s.fill(COL_BG)
+    header(s, "C-RID  RADAR", COL_GREEN)
+
+    # 同心圆：和固件一样按 6° 打 1px 点
+    for ring in range(1, 5):
+        r = 84 * ring // 4
+        for a in range(0, 360, 6):
+            rad = math.radians(a)
+            x = 104 + round(math.cos(rad) * r)
+            y = 128 - round(math.sin(rad) * r)
+            s.rect(x, y, 1, 1, COL_DIM)
+    s.hline(20, 128, 169, COL_GRID)
+    s.rect(104, 44, 1, 169, COL_GRID)
+    s.text(102, 30, "N", COL_DIM, COL_BG)
+    s.text(102, 214, "S", COL_DIM, COL_BG)
+    s.text(193, 125, "E", COL_DIM, COL_BG)
+    s.text(12, 125, "W", COL_DIM, COL_BG)
+
+    # 4 个有坐标目标 + 1 个无坐标目标（NOPOS 1），与固件打点一致
+    for x, y, sz, col in (
+        (148, 76, 7, COL_AMBER),   # 选中
+        (45, 90, 5, COL_GREEN),
+        (129, 170, 5, COL_GREEN),
+        (91, 187, 5, COL_DIM),     # 离线
+    ):
+        s.rect(x, y, sz, sz, col)
+
+    rows = [
+        ("AUTO 1.0km", COL_ACCENT),
+        ("GPS OK ~8m", COL_GREEN),
+        ("30.27415,120.15507", COL_DIM),
+        ("ON 3/5  NOPOS 1", COL_TEXT),
+        ("DJI Mavic 3 Pro", COL_AMBER),
+        ("810m  BRG 40", COL_TEXT),
+        ("ALT 126m", COL_DIM),
+    ]
+    for i, (txt, col) in enumerate(rows):
+        s.text(202, (28, 48, 62, 82, 106, 120, 134)[i], txt, col, COL_BG)
+
+    s.text(202, 160, "GREEN online", COL_GREEN, COL_BG)
+    s.text(202, 174, "AMBER selected", COL_AMBER, COL_BG)
+    s.text(202, 188, "GRAY offline", COL_DIM, COL_BG)
+    s.text(202, 204, "N-UP FIXED", COL_DIM, COL_BG)
+    s.text(8, 230, "M+LR: target   B/M: range   LR: page", COL_DIM, COL_BG)
+    return s
+
+
 # --------------------------------------------------------------------------- #
 # Overview sheet: 3 x 3 grid with captions, so the README shows one image.
 # --------------------------------------------------------------------------- #
@@ -555,6 +604,7 @@ PAGES = [
     ("03-sdr-5g8", "SDR 5.8 GHz", lambda: sdr_spectrum(True)),
     ("04-rid-status", "C-RID STATUS", rid_status),
     ("05-rid-targets", "RX TARGETS", rid_targets),
+    ("10-rid-radar", "C-RID RADAR", rid_radar),
     ("06-rid-detail", "TARGET DETAIL", rid_detail),
     ("07-rid-config", "CONFIG LIST", rid_config),
     ("08-rid-edit", "EDIT CONFIG", rid_edit),

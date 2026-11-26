@@ -32,6 +32,30 @@ static const char *TAG = "CN_C-RID_WEB";
 
 static cn_crid_config_t *s_config = NULL;
 
+/* ---- 运行态自身坐标（雷达页用） ----
+ * 手机浏览器/App 通过 GET /api/selfpos?lat=&lon=&acc= 上报真实位置。
+ * 与发射配置的 base_latitude/base_longitude 分开：那两个是「广播出去的模拟
+ * 位置」，会写 NVS；这里的坐标只存在 RAM，掉电即失，重启后等手机重新上报。 */
+static struct {
+    bool    valid;
+    double  lat;
+    double  lon;
+    float   acc;
+    int64_t us;          /* esp_timer_get_time()，单调时钟 */
+} s_selfpos;
+
+bool crid_web_selfpos_get(crid_selfpos_t *out) {
+    if (out == NULL || !s_selfpos.valid) return false;
+    int64_t age = esp_timer_get_time() - s_selfpos.us;
+    if (age < 0) age = 0;
+    out->valid = true;
+    out->latitude = s_selfpos.lat;
+    out->longitude = s_selfpos.lon;
+    out->accuracy_m = s_selfpos.acc;
+    out->age_ms = (uint32_t)(age / 1000);
+    return true;
+}
+
 // 由 crid-sim.c 提供：模式/标准切换后的运行时应用
 extern void crid_app_apply_mode(void);
 
@@ -323,6 +347,14 @@ static const char PAGE_HTML[] =
 "padding:3px 10px;cursor:pointer}"
 ".blebar .bfbtn:active{transform:scale(.97)}"
 ".blebar .blenk{text-decoration:none;line-height:1.45}"
+// 雷达自身坐标：手机定位上报入口。设备本身没有 GPS，雷达页要靠手机坐标定位
+".spbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 2px;"
+"padding:7px 10px;background:#fff8ed;border:1px solid #f5d9b3;border-radius:8px;"
+"font-size:12px;color:#8a5a13}"
+".spbar .bfbtn{flex:none;font-family:inherit;font-size:11.5px;font-weight:600;"
+"color:#7a4a00;background:#fff;border:1px solid #e8c99a;border-radius:12px;"
+"padding:3px 10px;cursor:pointer}"
+".spbar .bfbtn:active{transform:scale(.97)}"
 ".lgbar{height:8px;border-radius:5px;background:#eef1f4;overflow:hidden;margin:10px 0}"
 ".lgbar i{display:block;width:0;height:100%;background:#1565c0;transition:width .3s}"
 ".lgrow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #e5e7eb;"
@@ -625,6 +657,11 @@ static const char PAGE_HTML[] =
 "</div>"
 "<div class='rxbanner'><span class='dot live'></span>"
 "<span id='rxstate'>正在监听…</span></div>"
+// 雷达自身坐标：设备没有 GPS，用手机定位上报；上报后本机 TFT 的雷达页才能打点
+"<div class='spbar' id='spbar'>"
+"<button class='bfbtn' id='spbtn' type='button' onclick='spToggle()'>使用手机定位</button>"
+"<span id='sptxt'>雷达自身坐标：未上报</span>"
+"</div>"
 // 蓝牙取数：连上后网页的所有 /api 查询改走 BLE，Wi-Fi 可以断开去用流量看地图
 "<div class='blebar' id='blebar'>"
 "<span id='bletxt'>蓝牙取数未连接</span>"
@@ -2043,6 +2080,34 @@ static const char PAGE_HTML[] =
 "if(bleOn&&isApi&&m!=='GET')return Promise.reject(new Error('蓝牙模式下不能改配置，请连回热点'));"
 "if(bleOn&&isApi)return bleFetch(s);"
 "return _fetch(u,o);};"
+// ---- 手机定位上报：本机 TFT 的雷达页要靠「自身坐标」才能把目标画到方位上 ----
+// 设备没有 GPS；这里把手机定位用 GET 上报（至少间隔 4 秒），蓝牙和 Wi-Fi 都通。
+"var spOn=false,spTimer=null,spPos=null,spLast=0,spWatch=null;"
+"function spTxt(t,ok){var e=q('sptxt');if(!e)return;e.textContent=t;"
+"e.style.color=ok===true?'#0f8a4d':(ok===false?'#b91c1c':'#8a5a13');}"
+"function spPush(p){if(!p||!p.coords)return;spPos=p;"
+"var now=Date.now();if(now-spLast<4000)return;spLast=now;"
+"var c=p.coords;"
+"fetch('/api/selfpos?lat='+c.latitude.toFixed(7)+'&lon='+c.longitude.toFixed(7)"
+"+'&acc='+Math.round(c.accuracy||0))"
+".then(function(r){return r.json();}).then(function(j){"
+"if(j&&j.ok&&j.valid)spTxt('雷达坐标：'+c.latitude.toFixed(5)+', '+c.longitude.toFixed(5)"
+"+'（±'+Math.round(c.accuracy||0)+'m）',true);"
+"else spTxt('雷达坐标上报被拒绝',false);})"
+".catch(function(e){spTxt('雷达坐标上报失败：'+((e&&e.message)||e),false);});}"
+"function spErr(e){spTxt('定位不可用：'+((e&&e.message)||'权限被拒绝'),false);}"
+"function spToggle(){"
+"if(spOn){spOn=false;"
+"if(spTimer){clearInterval(spTimer);spTimer=null;}"
+"if(spWatch!=null&&navigator.geolocation){navigator.geolocation.clearWatch(spWatch);spWatch=null;}"
+"var b=q('spbtn');if(b)b.textContent='使用手机定位';"
+"spTxt('雷达自身坐标：已停止上报');return;}"
+"if(!navigator.geolocation){spTxt('这个浏览器不支持定位',false);return;}"
+"spOn=true;var b2=q('spbtn');if(b2)b2.textContent='停止上报定位';"
+"spTxt('正在获取手机定位…');"
+"spWatch=navigator.geolocation.watchPosition(function(p){spPush(p);},spErr,"
+"{enableHighAccuracy:true,maximumAge:5000,timeout:20000});"
+"spTimer=setInterval(function(){if(spPos)spPush(spPos);},8000);}"
 "bleUI();"
 // 首屏原本同时发 5 个请求（config / status / time / ota / log），httpd 的客户端槽
 // 只有几个，排队等槽时浏览器容易判超时或收到连接重置——表现就是「页面参数全空」。
@@ -3116,6 +3181,59 @@ static esp_err_t handler_time_get(httpd_req_t *req) {
 }
 
 /**
+ * @brief 雷达自身坐标：GET 带参=上报，GET 不带参=查询
+ *
+ * 只用 GET 是刻意的：网页在蓝牙模式下会把所有 /api GET 转发到 BLE 桥，
+ * 手机 App 也只需要发一条路径字符串，不用为定位单独做一套 POST 分帧。
+ * 例：/api/selfpos?lat=31.2304160&lon=121.4737010&acc=8
+ * 坐标只在 RAM 中，不写 NVS；0,0 视为「手机还没拿到定位」直接拒绝。
+ */
+static esp_err_t handler_selfpos(httpd_req_t *req) {
+    char qs[96], v[24];
+    bool asked = false, accepted = false;
+    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK) {
+        double la = 0, lo = 0;
+        if (httpd_query_key_value(qs, "lat", v, sizeof(v)) == ESP_OK) {
+            la = strtod(v, NULL);
+            asked = true;
+        }
+        if (httpd_query_key_value(qs, "lon", v, sizeof(v)) == ESP_OK) lo = strtod(v, NULL);
+        if (asked && (la != 0.0 || lo != 0.0) && la >= -90.0 && la <= 90.0 &&
+            lo >= -180.0 && lo <= 180.0) {
+            s_selfpos.lat = la;
+            s_selfpos.lon = lo;
+            s_selfpos.acc = 0;
+            if (httpd_query_key_value(qs, "acc", v, sizeof(v)) == ESP_OK) {
+                float a = (float)strtod(v, NULL);
+                if (a > 0) s_selfpos.acc = a;
+            }
+            s_selfpos.us = esp_timer_get_time();
+            s_selfpos.valid = true;
+            accepted = true;
+        }
+    }
+
+    char out[128];
+    if (s_selfpos.valid) {
+        uint32_t age = 0;
+        int64_t d = esp_timer_get_time() - s_selfpos.us;
+        if (d > 0) age = (uint32_t)(d / 1000);
+        snprintf(out, sizeof(out),
+                 "{\"ok\":%s,\"valid\":true,\"lat\":%.7f,\"lon\":%.7f,"
+                 "\"acc\":%.1f,\"age_ms\":%u}",
+                 (!asked || accepted) ? "true" : "false",
+                 s_selfpos.lat, s_selfpos.lon, (double)s_selfpos.acc, (unsigned)age);
+    } else {
+        snprintf(out, sizeof(out), "{\"ok\":%s,\"valid\":false}",
+                 (!asked || accepted) ? "true" : "false");
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+/**
  * @brief 明文端口的唯一职责：把请求 302 到 https
  *
  * 页面与接口现在只挂在 443 上，书签或习惯里输 http://192.168.4.1 会打不开。
@@ -3151,6 +3269,7 @@ static const httpd_uri_t uris[] = {
     { .uri = "/api/config",.method = HTTP_GET,  .handler = handler_get_config,.user_ctx = NULL },
     { .uri = "/api/config",.method = HTTP_POST, .handler = handler_post_config,.user_ctx = NULL },
     { .uri = "/api/status",.method = HTTP_GET,  .handler = handler_status,    .user_ctx = NULL },
+    { .uri = "/api/selfpos",.method = HTTP_GET, .handler = handler_selfpos,   .user_ctx = NULL },
     { .uri = "/api/rx",    .method = HTTP_GET,  .handler = handler_rx,        .user_ctx = NULL },
     { .uri = "/api/reset", .method = HTTP_POST, .handler = handler_reset,     .user_ctx = NULL },
     { .uri = "/api/time",  .method = HTTP_POST, .handler = handler_time,      .user_ctx = NULL },
@@ -3476,8 +3595,9 @@ static httpd_handle_t start_https_server(void) {
     }
     register_all_uris(srv);
     s_srv_https = srv;      // 供客户端断开时回收残留会话
-    ESP_LOGI(TAG, "HTTPS 已启动: https://192.168.4.1 (heap=%u hblk=%u)",
+    ESP_LOGI(TAG, "HTTPS 已启动: https://192.168.4.1 (heap=%u hmin=%u hblk=%u)",
              (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     return srv;
 }

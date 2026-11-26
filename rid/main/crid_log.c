@@ -65,8 +65,6 @@ static QueueHandle_t     s_q;
 static SemaphoreHandle_t s_mux;
 static crid_log_target_t s_tg[MAX_TARGETS];
 static int               s_tgn;
-// 遍历用扇区缓冲：不放栈（httpd 任务栈只有 8 KB），且要求 4 字节对齐
-static uint8_t s_sbuf[SECTOR_SIZE] __attribute__((aligned(4)));
 
 /* ---------------- 单目标删除的墓碑表 ----------------
  * 环形日志是追加写，没法就地删掉某个目标的记录（擦除最小单位是 4 KB 扇区，
@@ -397,14 +395,26 @@ esp_err_t crid_log_init(void) {
             // 列表里就永远看不到真实值。从环形最旧的扇区 s_wsec 开始绕一圈，
             // 处理顺序正好是旧 -> 新，最后落到最新一条，newest_tick / last_* 也就准确。
             // 整圈 4 MB、逐扇区整块读，65536 条约 0.2~0.5 s。
+            // 扇区缓冲按需分配；分配不到就退化成逐条读。
+            uint8_t *buf = (uint8_t *)malloc(SECTOR_SIZE);
             for (uint16_t i = 0; i < s_secs; i++) {
                 uint16_t sec = (uint16_t)((s_wsec + i) % s_secs);
-                if (esp_partition_read(s_part, sec_off(sec), s_sbuf, SECTOR_SIZE) != ESP_OK) continue;
-                for (int k = 0; k < PER_SEC; k++) {
-                    crid_log_rec_t *r = (crid_log_rec_t *)(void *)(s_sbuf + (size_t)k * CRID_LOG_REC_SIZE);
-                    if (rec_live(r)) target_update(r, true);
+                if (buf != NULL) {
+                    if (esp_partition_read(s_part, sec_off(sec), buf, SECTOR_SIZE) != ESP_OK) continue;
+                    for (int k = 0; k < PER_SEC; k++) {
+                        crid_log_rec_t *r = (crid_log_rec_t *)(void *)(buf + (size_t)k * CRID_LOG_REC_SIZE);
+                        if (rec_live(r)) target_update(r, true);
+                    }
+                } else {
+                    for (int k = 0; k < PER_SEC; k++) {
+                        crid_log_rec_t r;
+                        if (esp_partition_read(s_part, sec_off(sec) + (uint32_t)k * CRID_LOG_REC_SIZE,
+                                               &r, CRID_LOG_REC_SIZE) != ESP_OK || !rec_live(&r)) continue;
+                        target_update(&r, true);
+                    }
                 }
             }
+            free(buf);
         }
     }
 
@@ -522,26 +532,42 @@ int crid_log_points(const uint8_t mac[6], uint32_t skip, uint32_t limit,
 
 void crid_log_foreach(crid_log_cb_t cb, void *ctx) {
     if (!s_ready || cb == NULL) return;
+    // 扇区缓冲按需分配：导出不是常驻路径，4 KB 用完立即归还。
+    // 分配不到就退化成逐条读，只影响速度。
+    uint8_t *buf = (uint8_t *)malloc(SECTOR_SIZE);
     // 当前写扇区就是环形里最旧的那一段，从它开始绕一圈即时间顺序
     uint16_t start = s_wsec;
     for (uint16_t i = 0; i < s_secs; i++) {
         uint16_t sec = (uint16_t)((start + i) % s_secs);
-        if (esp_partition_read(s_part, sec_off(sec), s_sbuf, SECTOR_SIZE) != ESP_OK) continue;
-        for (int k = 0; k < PER_SEC; k++) {
-            crid_log_rec_t *r = (crid_log_rec_t *)(void *)(s_sbuf + (size_t)k * CRID_LOG_REC_SIZE);
-            if (!rec_live(r)) continue;
-            if (!cb(r, ctx)) return;
+        if (buf != NULL) {
+            if (esp_partition_read(s_part, sec_off(sec), buf, SECTOR_SIZE) != ESP_OK) continue;
+            for (int k = 0; k < PER_SEC; k++) {
+                crid_log_rec_t *r = (crid_log_rec_t *)(void *)(buf + (size_t)k * CRID_LOG_REC_SIZE);
+                if (!rec_live(r)) continue;
+                if (!cb(r, ctx)) {
+                    free(buf);
+                    return;
+                }
+            }
+        } else {
+            for (int k = 0; k < PER_SEC; k++) {
+                crid_log_rec_t r;
+                if (esp_partition_read(s_part, sec_off(sec) + (uint32_t)k * CRID_LOG_REC_SIZE,
+                                       &r, CRID_LOG_REC_SIZE) != ESP_OK || !rec_live(&r)) continue;
+                if (!cb(&r, ctx)) return;
+            }
         }
     }
+    free(buf);
 }
 
 /* ---------------- 单目标删除 ---------------- */
 
 // 按存活记录重算总条数与各目标计数（删除后调用，一次 4 MB 顺序读，约 0.1~0.5 s）
 //
-// 这里刻意不复用 s_sbuf：那块缓冲是 crid_log_foreach（CSV 导出）在用的，而 80 和
-// 443 是两个独立的 httpd 任务，导出与删除完全可能真的同时在跑，共用缓冲会互相踩。
-// 改用一次性 malloc 的 4 KB，用完就还；分配不到就退化成逐条读（慢一点，但正确）。
+// 每次操作各自 malloc 一块 4 KB 扇区缓冲：80 和 443 是两个独立的 httpd 任务，
+// CSV 导出与删除完全可能真的同时在跑，共用缓冲会互相踩。用完就还；
+// 分配不到就退化成逐条读（慢一点，但正确）。
 static void rebuild_locked(void) {
     s_tgn = 0;
     uint32_t n = 0;

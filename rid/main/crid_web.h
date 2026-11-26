@@ -3,6 +3,8 @@
 
 #include "crid_config.h"
 #include "esp_err.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +40,25 @@ void crid_web_purge_sessions(void);
  * 不传的话 IDF 会直接报「No server verification option set」握手失败。
  */
 const char *crid_web_cert_pem(void);
+
+/**
+ * @brief 取手机上报的「本机真实坐标」（雷达页用）
+ *
+ * 与发射配置里的 base_latitude/base_longitude 完全独立：那是广播出去的模拟
+ * 位置、会写 NVS；这里只保存运行态，掉电即失。
+ *
+ * @param out 输出坐标快照
+ * @return 从未收到过定位时返回 false
+ */
+typedef struct {
+    bool     valid;
+    double   latitude;
+    double   longitude;
+    float    accuracy_m;   /**< 手机给出的水平精度，未知为 0 */
+    uint32_t age_ms;       /**< 距上次上报的毫秒数 */
+} crid_selfpos_t;
+
+bool crid_web_selfpos_get(crid_selfpos_t *out);
 
 #ifdef __cplusplus
 }

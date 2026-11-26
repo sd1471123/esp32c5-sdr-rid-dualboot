@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
@@ -270,6 +271,11 @@ void app_main(void) {
     // 9. 保险起见再确认一次 OTA 状态。合并工程在启动时已经确认并把启动目标
     //    交还 launcher，这里再调一次是幂等的，不会打误导性的错误日志。
     dualboot_confirm_running();
+
+    ESP_LOGI(TAG, "RAM 基线: heap=%u hmin=%u hblk=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     ESP_LOGI(TAG, "C-RID started successfully! (band=%s, tx=%u, rx=%u, std=%u)",
              g_config.band == CRID_BAND_5G ? "5.8G" : "2.4G",

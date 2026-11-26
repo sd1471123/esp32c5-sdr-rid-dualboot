@@ -42,13 +42,15 @@
 | 浏览器 | 手机/电脑连 C-RID 的热点（名字以 `ESP32-CRID-` 开头），打开 <https://192.168.4.1>（**是 https**，80 端口只做跳转）。**默认 WiFi 密码请到我的项目说明里查看**：[esp32-ChinaRemoteID_Scan_Sim](https://github.com/sd1471123/esp32-ChinaRemoteID_Scan_Sim) |
 | Android | [esp32-ChinaRemoteID_Scan_Sim](https://github.com/sd1471123/esp32-ChinaRemoteID_Scan_Sim) 仓库的 `android/` 目录（APK 也在它的 Releases 里）。BLE 优先，没连蓝牙时回落到热点 HTTPS；**OTA 升级必须连热点**，BLE 传不动 1.3 MB 的固件 |
 
+雷达页需要手机告诉板子自身位置：网页在“接收监测”卡片点 **使用手机定位**，或 Android 客户端连接后自动上报（约 4 秒一次，走 `GET /api/selfpos`，蓝牙和热点都行）。坐标只存设备 RAM，不写 NVS，也不影响发射配置。
+
 ## 界面预览
 
-![九个页面总览](docs/screens/overview.png)
+![十个页面总览](docs/screens/overview.png)
 
 上面是**模拟渲染**图，不是相机拍屏：像素由固件自己的字库（`font5x7` / `font7x12`）和页面里写死的坐标逐个画出来，所以字号、行距、每行能塞多少字、灰阶配色都与实物一致，只是没有 IPS 视角、背光溢出这类光学效果。这样也方便改了 UI 之后重新出图对照。
 
-九宫格按使用顺序排列：开机菜单 → SDR 两个频段 → C-RID 状态 / 目标 / 详情 / 配置 / 关于。
+总览按使用顺序排列：开机菜单 → SDR 两个频段 → C-RID 状态 / 目标 / 雷达 / 详情 / 配置 / 关于。
 
 | 页面 | 截图 |
 |---|---|
@@ -57,6 +59,7 @@
 | SDR 5.8 GHz：窄峰群 + 29 格频率轴，带 RADAR / SAT / ISM 区段 | [`03-sdr-5g8.png`](docs/screens/03-sdr-5g8.png) |
 | C-RID 状态页（参数总览） | [`04-rid-status.png`](docs/screens/04-rid-status.png) |
 | C-RID 接收目标列表 | [`05-rid-targets.png`](docs/screens/05-rid-targets.png) |
+| C-RID 雷达页（同心圈 + 方位打点 + 自动量程） | [`10-rid-radar.png`](docs/screens/10-rid-radar.png) |
 | 目标详情（12 行字段，只刷数值） | [`06-rid-detail.png`](docs/screens/06-rid-detail.png) |
 | 配置列表 / 编辑项 | [`07-rid-config.png`](docs/screens/07-rid-config.png) · [`08-rid-edit.png`](docs/screens/08-rid-edit.png) |
 | 关于页（版本 / 分区 / 背光档位） | [`09-rid-about.png`](docs/screens/09-rid-about.png) |
@@ -173,7 +176,8 @@ C5mix/
 | SDR 固件 | 原有全部操作不变：`←/→` 走信道，`B` 切频段，`M` 切模式，`R` 短按转屏 / 长按 **5 秒**恢复出厂 |
 | SDR 固件 | 组合键：`B + ←/→` 调上限、`M + ←/→` 调下限、`R + ←/→` 切背光、`← + →` 同时静音（静音状态存 NVS，开机延续） |
 | SDR 固件 | **新增**：`B + M` 同时按住 1.5 秒 → 回开机菜单 |
-| C-RID 固件 | `←/→` 翻显示页（状态 / 目标 / 关于 / **配置**）；目标页 `M + ←/→` 或 `B + ←/→` 翻航迹；**目标页点按 `M` 或 `B` 进入该目标详情页**（12 行大字：MAC / RSSI+信道 / 协议 / 报文数+时效 / UAS ID / 机型 / 操作员 / 坐标 / 高度+AGL / 速度+航向 / 状态+UA 类型 / 飞手位置；标签固定不动、只刷数值），详情页 `←/→` 切换目标、再点按 `M` 或 `B` 返回列表；`R + ←/→` 切背光；`← + →` 同时静音（静音状态存 NVS，开机延续） |
+| C-RID 固件 | `←/→` 翻显示页（状态 / 目标 / **雷达** / 关于 / **配置**）；目标页 `M + ←/→` 或 `B + ←/→` 翻航迹；**目标页点按 `M` 或 `B` 进入该目标详情页**（12 行大字：MAC / RSSI+信道 / 协议 / 报文数+时效 / UAS ID / 机型 / 操作员 / 坐标 / 高度+AGL / 速度+航向 / 状态+UA 类型 / 飞手位置；标签固定不动、只刷数值），详情页 `←/→` 切换目标、再点按 `M` 或 `B` 返回列表；`R + ←/→` 切背光；`← + →` 同时静音（静音状态存 NVS，开机延续） |
+| C-RID 固件 | **雷达页**：固定上北下南，原点为手机上报的自身坐标；`B` / `M` 点按切量程（自动 / 200m / 500m / 1km / 2km / 5km，档位存 NVS），`B + ←/→` 或 `M + ←/→` 选目标；右侧显示量程、GPS 精度、在线数，以及选中目标的距离 / 方位 / 高度；手机定位超过 30 秒没更新显示 `GPS STALE`，从未上报显示 `NO SELF POS` |
 | C-RID 固件 | **配置页**：列表态 `←/→` 选项目、点按 `B` 进 EDIT 页；**EDIT 页编辑完态**：点按 `B` 切下一项，字符串项（UAS ID / 机型名 / 操作员 ID）用 `←/→` 移动字符光标、数值项用 `←/→` 直接改值，长按 `B` 1 秒进改值态；**改值态**：`←/→` 改当前字符/数值、字符串项点按 `B` 移下一字符、`M` 退回编辑完态；列表态或编辑完态按 `M` = 保存全部并立即生效、退回状态页；12 项含收发模式、标准、频段、信道、UAS ID、机型名、操作员 ID、经纬度、海拔、速度、广播间隔 |
 | C-RID 固件 | **新增**：`B + M` 同时按住 1.5 秒 → 回开机菜单（配置页里相当于放弃未保存的修改）；`R` 点按仅蜂鸣、长按无功能 |
 
@@ -200,7 +204,7 @@ C-RID 的网页配置入口（`https://192.168.4.1`）和 BLE 数据通道完全
 
 ```bash
 python -m esptool --chip esp32c5 -p COM5 -b 460800 \
-    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.0.1-full-16mb.bin
+    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.0.3-full-16mb.bin
 ```
 
 同一页的 `...-parts.zip` 里是分体 bin 和一张 `FLASH.txt` 地址表，只想更新 C-RID 或想保留 NVS 设置时用；`SHA256SUMS.txt` 是校验和。
@@ -212,7 +216,7 @@ python -m esptool --chip esp32c5 -p COM5 -b 460800 \
 # Git Bash：先设好 IDF_PATH / IDF_PYTHON_ENV_PATH，或先 source ESP-IDF 的 export.sh
 bash tools/build_all.sh
 bash tools/flash_all.sh -p COM6          # 整片烧录，会清 NVS
-python tools/package_release.py --version v0.02   # 出发布包：整片镜像 + 分体 zip + 校验和
+python tools/package_release.py --version v0.0.3   # 出发布包：整片镜像 + 分体 zip + 校验和
 ```
 
 PowerShell：
@@ -234,8 +238,8 @@ powershell -ExecutionPolicy Bypass -File tools\flash_all.ps1 -p COM6
 0x620000 out/rid_b.bin
 ```
 
-本机已用 ESP-IDF 6.1 实际编译通过三个工程：launcher `0x39340`、SDR `0xd85b0`、
-RID `0x1b1eb0` 字节（加本地配置页后增大）。RID 构建末尾会出现一条
+本机已用 ESP-IDF 6.1 实际编译通过三个工程：launcher `0x39420`、SDR `0xd85d0`、
+RID `0x1b6330` 字节（加雷达页后增大）。RID 构建末尾会出现一条
 `Part 'factory' 0/0 @ 0x20000 size 0x100000 (overflow ...)` 警告——那是共用分区表里
 1 MB 的 launcher 槽装不下 RID 镜像，**是预期的**：RID 只会烧进 3 MB 的 `rid_a` / `rid_b`，
 不影响使用。
@@ -257,10 +261,19 @@ RID `0x1b1eb0` 字节（加本地配置页后增大）。RID 构建末尾会出�
 - `main/crid_ota.c`：网页 OTA 的写入目标从“自动轮换三个 ota 槽”改为**只在 rid_a / rid_b 之间轮换**，
   避免 OTA 把 SDR 固件覆盖掉。
 - `main/crid-sim.c`：启动确认 OTA 状态 + 交还启动目标；启动本地 TFT 任务。
-- `main/crid_lcd.c`（新增）：四页本地显示（状态 / 接收目标 / 关于 / **配置**）；配置页用按键改 12 项参数并保存到 NVS，保存后复用网页那套逻辑重建 AP / 应用收发开关，立即生效。
+- `main/crid_lcd.c`（新增）：五页本地显示（状态 / 接收目标 / **雷达** / 关于 / **配置**）；雷达页用同心圈按方位画目标，量程自动或 B/M 手动、档位存 NVS；配置页用按键改 12 项参数并保存到 NVS，保存后复用网页那套逻辑重建 AP / 应用收发开关，立即生效。
+- `main/crid_web.c`：新增 `GET /api/selfpos?lat=&lon=&acc=`（只存 RAM，不写 NVS），网页接收监测卡片新增“使用手机定位”按钮，定时上报手机坐标。
 - 根目录 CMake 增加 `../common/panel` 与 `../common/dualboot` 组件。
 
 ## 版本历史
+
+### v0.0.3 — 本地 TFT 雷达页 + 手机定位
+
+- **雷达页**：C-RID 新增第 3 页，用四圈同心圆按方位显示扫到的目标；固定上北下南（设备无陀螺仪），原点为手机上报的自身坐标。在线绿、选中琥珀、离线灰；右侧显示量程、GPS 精度、在线数与选中目标的距离 / 方位 / 高度，无坐标目标单独计数。
+- **量程**：自动档按最远目标在 200m / 500m / 1km / 2km / 5km 之间带滞回切换，`B` / `M` 可手动覆盖并记忆到 NVS；手动量程装不下的目标贴外圈显示。
+- **自身坐标**：新增 `GET /api/selfpos?lat=&lon=&acc=`，手机通过热点或 BLE 上报；坐标只在 RAM，不写 NVS、不动发射配置。网页接收卡片新增“使用手机定位”，Android 客户端连接后自动上报。
+- **Android 2.0.4**：连接后自动开启手机定位并每约 4 秒上报一次；权限弹窗支持只给模糊定位。
+- **兼容性**：分区表、BLE 帧、ridlog 记录格式均未变；只更新 C-RID 时按 `0x320000` / `0x620000` 烧两个槽即可保留 NVS 设置。
 
 ### v0.0.2 — RID 升级到 v2.0.3 / RX 扫描蜂鸣提示
 

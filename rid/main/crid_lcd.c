@@ -14,6 +14,7 @@
 #include "dual_boot.h"
 
 #include "crid_rx.h"
+#include "crid_web.h"
 #include "crid_wifi.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -21,6 +22,7 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -31,7 +33,7 @@ extern void crid_app_apply_mode(void);
 static const char *TAG = "crid_lcd";
 static cn_crid_config_t *s_cfg;
 static cn_crid_config_t s_edit;          /* 编辑期的暂存副本，保存才写回 */
-static uint8_t s_page;                   /* 0=status 1=targets 2=about 3=config */
+static uint8_t s_page;                   /* 0=status 1=targets 2=radar 3=about 4=config */
 static uint8_t s_bright = 100;
 static unsigned s_target;
 static bool s_muted;
@@ -785,6 +787,276 @@ static void render_config(void) {
     }
 }
 
+/* ---- 雷达页 ----
+ * 设备没有陀螺仪/罗盘，所以方位固定「上北下南、右东左西」，不随设备转动。
+ * 本机坐标从手机上报的 /api/selfpos 取（App 连蓝牙自动报，或网页点「使用
+ * 手机定位」）；坐标只在 RAM 中，超过 30 秒未更新按过期处理。
+ *
+ * 屏上分三块：
+ *   - 静态表盘：4 圈同心圆 + 十字线 + 方位字，只在进页时画一次；
+ *   - 目标光点：每次刷新只擦/画位置或颜色变化的小方块；
+ *   - 右侧信息列：量程、GPS 状态、在线数量、选中目标，逐行比对后才重画。 */
+#define RADAR_CX       104
+#define RADAR_CY       128
+#define RADAR_R        84
+#define RADAR_X0       202      /* 右侧信息列起点 */
+#define RADAR_STALE_MS 30000    /* 手机定位超过 30 秒没更新就标为过期 */
+
+static const uint16_t k_radar_ranges[] = { 200, 500, 1000, 2000, 5000 };
+static uint8_t s_radar_rng;     /* 0=自动，1..5 对应 k_radar_ranges */
+static uint16_t s_radar_auto = 500;  /* 自动量程当前档：带滞回，避免目标在边界来回跳 */
+
+/* 量程记忆：和静音一样，在 crid 命名空间里单独放一个字节键，不牵动配置 blob。
+ * 只在用户按 B/M 切档时写一次，NVS 磨损可以忽略。 */
+#define LCD_RADAR_NVS_KEY "radar"
+
+static void radar_rng_save(uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(LCD_MUTE_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_u8(h, LCD_RADAR_NVS_KEY, v) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+}
+
+static uint8_t radar_rng_load(void) {
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open(LCD_MUTE_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, LCD_RADAR_NVS_KEY, &v) != ESP_OK || v > 5) v = 0;
+        nvs_close(h);
+    }
+    return v;
+}
+
+/* 切下一档量程并立即落盘（B/M 两个键共用） */
+static void radar_rng_next(void) {
+    s_radar_rng = (uint8_t)((s_radar_rng + 1) % 6);
+    radar_rng_save(s_radar_rng);
+}
+
+typedef struct {
+    int16_t  x, y;
+    uint8_t  sz;
+    uint16_t col;
+    bool     drawn;
+} radar_blip_t;
+
+static radar_blip_t s_radar_blips[CRID_RX_MAX_TRACKS];
+
+static struct {
+    char     text[20];
+    uint16_t col;
+} s_radar_info[7];
+
+#define RADAR_IRND(v) ((int)((v) >= 0 ? (v) + 0.5f : (v) - 0.5f))
+
+static void radar_blip_erase(radar_blip_t *b) {
+    int x = b->x - 1, y = b->y - 1;
+    int w = b->sz + 2, h = b->sz + 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > PANEL_W) w = PANEL_W - x;
+    if (y + h > PANEL_H) h = PANEL_H - y;
+    if (w > 0 && h > 0) panel_rect((unsigned)x, (unsigned)y, (unsigned)w, (unsigned)h, COL_BG);
+    b->drawn = false;
+}
+
+/* 右侧信息列：同一行文字/颜色都没变就完全不动屏 */
+static void radar_info_line(unsigned slot, unsigned y, uint16_t color, const char *text) {
+    if (slot >= sizeof(s_radar_info) / sizeof(s_radar_info[0])) return;
+    if (s_radar_info[slot].col == color && strcmp(s_radar_info[slot].text, text) == 0) return;
+    snprintf(s_radar_info[slot].text, sizeof(s_radar_info[slot].text), "%s", text);
+    s_radar_info[slot].col = color;
+    panel_rect(RADAR_X0, y, PANEL_W - RADAR_X0, 10, COL_BG);
+    if (text[0]) panel_text(RADAR_X0, y, text, color, COL_BG, false, 1);
+}
+
+/* 只刷新动态部分：GPS 状态、量程、计数、选中信息、目标光点 */
+static void radar_refresh(void) {
+    crid_selfpos_t sp;
+    bool has_sp = crid_web_selfpos_get(&sp);
+    bool fresh = has_sp && sp.age_ms <= RADAR_STALE_MS;
+
+    int n = crid_rx_get_tracks(s_tracks);
+    if (n < 0) n = 0;
+    if (n > CRID_RX_MAX_TRACKS) n = CRID_RX_MAX_TRACKS;
+    if (n > 0 && s_target >= (unsigned)n) s_target = 0;
+
+    int online = 0, nopos = 0;
+    float de[CRID_RX_MAX_TRACKS], dn[CRID_RX_MAX_TRACKS];
+    bool  pv[CRID_RX_MAX_TRACKS] = { false };
+    float maxd = 0;
+
+    double kx = 0;
+    if (fresh) kx = 111320.0 * cos(sp.latitude * 0.0174532925199433);
+    for (int i = 0; i < n; i++) {
+        const crid_rx_track_t *t = &s_tracks[i];
+        if (t->active) online++;
+        bool has_ll = !(t->latitude == 0.0 && t->longitude == 0.0);
+        if (!has_ll) { nopos++; continue; }
+        if (!fresh) continue;
+        de[i] = (float)((t->longitude - sp.longitude) * kx);
+        dn[i] = (float)((t->latitude - sp.latitude) * 110540.0);
+        pv[i] = true;
+        float d = sqrtf(de[i] * de[i] + dn[i] * dn[i]);
+        if (d > maxd) maxd = d;
+    }
+
+    /* 量程：自动取「刚好装下最远目标」的那一档，留 15% 边距；B/M 可手动覆盖。
+     * 自动档带滞回：只有装不下、或目标缩到量程 30% 以内才换档，否则目标在
+     * 档位边界小幅移动时整个画面会反复缩放。 */
+    uint16_t range;
+    if (s_radar_rng == 0) {
+        float need = maxd * 1.15f;
+        range = s_radar_auto;
+        bool fit = (need <= 0.1f) || (need <= (float)range && need >= (float)range * 0.3f);
+        if (!fit) {
+            range = k_radar_ranges[sizeof(k_radar_ranges) / sizeof(k_radar_ranges[0]) - 1];
+            for (unsigned k = 0; k < sizeof(k_radar_ranges) / sizeof(k_radar_ranges[0]); k++) {
+                if ((float)k_radar_ranges[k] >= need) { range = k_radar_ranges[k]; break; }
+            }
+            s_radar_auto = range;
+        }
+    } else {
+        range = k_radar_ranges[(s_radar_rng - 1) % 5];
+    }
+
+    char line[48];
+    if (range >= 1000)
+        snprintf(line, sizeof(line), "%s %.1fkm", s_radar_rng ? "RNG" : "AUTO",
+                 (double)range / 1000.0);
+    else
+        snprintf(line, sizeof(line), "%s %um", s_radar_rng ? "RNG" : "AUTO", (unsigned)range);
+    radar_info_line(0, 28, COL_ACCENT, line);
+
+    if (!has_sp) {
+        radar_info_line(1, 48, COL_RED, "NO SELF POS");
+        radar_info_line(2, 62, COL_DIM, "Phone GPS not set");
+    } else if (!fresh) {
+        snprintf(line, sizeof(line), "GPS STALE %us", (unsigned)(sp.age_ms / 1000));
+        radar_info_line(1, 48, COL_AMBER, line);
+        radar_info_line(2, 62, COL_DIM, "Phone GPS stale");
+    } else {
+        snprintf(line, sizeof(line), "GPS OK ~%.0fm", (double)sp.accuracy_m);
+        radar_info_line(1, 48, COL_GREEN, line);
+        snprintf(line, sizeof(line), "%.5f,%.5f", sp.latitude, sp.longitude);
+        radar_info_line(2, 62, COL_DIM, line);
+    }
+
+    snprintf(line, sizeof(line), "ON %d/%d  NOPOS %d", online, n, nopos);
+    radar_info_line(3, 82, COL_TEXT, line);
+
+    if (n > 0) {
+        const crid_rx_track_t *t = &s_tracks[s_target];
+        snprintf(line, sizeof(line), "%.18s",
+                 t->drone_name[0] ? t->drone_name : (t->uas_id[0] ? t->uas_id : "--"));
+        radar_info_line(4, 106, COL_AMBER, line);
+        if (pv[s_target]) {
+            float d = sqrtf(de[s_target] * de[s_target] + dn[s_target] * dn[s_target]);
+            float brg = atan2f(de[s_target], dn[s_target]) * 57.29578f;
+            if (brg < 0) brg += 360.0f;
+            if (d >= 1000)
+                snprintf(line, sizeof(line), "%.1fkm  BRG %.0f", (double)(d / 1000.0f), (double)brg);
+            else
+                snprintf(line, sizeof(line), "%um  BRG %.0f", (unsigned)d, (double)brg);
+            radar_info_line(5, 120, COL_TEXT, line);
+            snprintf(line, sizeof(line), "ALT %.0fm", (double)t->altitude_geo);
+            radar_info_line(6, 134, COL_DIM, line);
+        } else {
+            radar_info_line(5, 120, COL_DIM, "no position");
+            radar_info_line(6, 134, COL_DIM, t->active ? "online" : "offline");
+        }
+    } else {
+        radar_info_line(4, 106, COL_DIM, "no targets");
+        radar_info_line(5, 120, COL_BG, "");
+        radar_info_line(6, 134, COL_BG, "");
+    }
+
+    /* 两遍处理：先擦掉所有位置/颜色变化的旧光点，再统一画新的。
+     * 否则两个目标挨得很近时，后一个的擦除会把前一个刚画好的点抹掉。 */
+    struct {
+        int x, y, sz;
+        uint16_t col;
+        bool ok;
+    } pend[CRID_RX_MAX_TRACKS];
+    memset(pend, 0, sizeof(pend));
+
+    for (int i = 0; i < CRID_RX_MAX_TRACKS; i++) {
+        radar_blip_t *b = &s_radar_blips[i];
+        bool want = fresh && i < n && pv[i];
+        if (!want) {
+            if (b->drawn) radar_blip_erase(b);
+            continue;
+        }
+        float d = sqrtf(de[i] * de[i] + dn[i] * dn[i]);
+        float sx = de[i] * (float)RADAR_R / (float)range;
+        float sy = dn[i] * (float)RADAR_R / (float)range;
+        if (d > (float)range && d > 0) {          /* 手动量程装不下时贴到圆环上 */
+            sx = de[i] / d * (float)RADAR_R;
+            sy = dn[i] / d * (float)RADAR_R;
+        }
+        int x = RADAR_CX + RADAR_IRND(sx);
+        int y = RADAR_CY - RADAR_IRND(sy);
+        int sz = (i == (int)s_target) ? 7 : 5;
+        uint16_t col = !s_tracks[i].active ? COL_DIM
+                       : (i == (int)s_target ? COL_AMBER : COL_GREEN);
+        if (x < 4) x = 4;
+        if (x > PANEL_W - 12) x = PANEL_W - 12;
+        if (y < HDR_H + 3) y = HDR_H + 3;
+        if (y > PANEL_H - 12) y = PANEL_H - 12;
+        if (b->drawn && (b->x != x || b->y != y || b->sz != sz || b->col != col))
+            radar_blip_erase(b);
+        pend[i].x = x; pend[i].y = y; pend[i].sz = sz; pend[i].col = col; pend[i].ok = true;
+    }
+    for (int i = 0; i < CRID_RX_MAX_TRACKS; i++) {
+        if (!pend[i].ok) continue;
+        radar_blip_t *b = &s_radar_blips[i];
+        if (b->drawn && b->x == pend[i].x && b->y == pend[i].y &&
+            b->sz == pend[i].sz && b->col == pend[i].col) continue;
+        panel_rect((unsigned)pend[i].x, (unsigned)pend[i].y,
+                   (unsigned)pend[i].sz, (unsigned)pend[i].sz, pend[i].col);
+        b->x = (int16_t)pend[i].x;
+        b->y = (int16_t)pend[i].y;
+        b->sz = (uint8_t)pend[i].sz;
+        b->col = pend[i].col;
+        b->drawn = true;
+    }
+}
+
+static void radar_dial(void) {
+    /* 同心圆按 6° 打点：一整圈 60 个 1px 点，比逐行算圆弧省一个量级的 SPI 写 */
+    for (unsigned ring = 1; ring <= 4; ring++) {
+        int r = RADAR_R * (int)ring / 4;
+        for (int a = 0; a < 360; a += 6) {
+            float rad = (float)a * 0.0174532925f;
+            int x = RADAR_CX + RADAR_IRND(cosf(rad) * (float)r);
+            int y = RADAR_CY - RADAR_IRND(sinf(rad) * (float)r);
+            panel_rect((unsigned)x, (unsigned)y, 1, 1, COL_DIM);
+        }
+    }
+    panel_hline((unsigned)(RADAR_CX - RADAR_R), RADAR_CY, RADAR_R * 2 + 1, COL_GRID);
+    panel_rect(RADAR_CX, RADAR_CY - RADAR_R, 1, RADAR_R * 2 + 1, COL_GRID);
+    panel_text(RADAR_CX - 2, 30, "N", COL_DIM, COL_BG, false, 1);
+    panel_text(RADAR_CX - 2, 214, "S", COL_DIM, COL_BG, false, 1);
+    panel_text(193, RADAR_CY - 3, "E", COL_DIM, COL_BG, false, 1);
+    panel_text(12, RADAR_CY - 3, "W", COL_DIM, COL_BG, false, 1);
+    /* 右下角图例与固定方位提示（静态，只画一次） */
+    panel_text(RADAR_X0, 160, "GREEN online", COL_GREEN, COL_BG, false, 1);
+    panel_text(RADAR_X0, 174, "AMBER selected", COL_AMBER, COL_BG, false, 1);
+    panel_text(RADAR_X0, 188, "GRAY offline", COL_DIM, COL_BG, false, 1);
+    panel_text(RADAR_X0, 204, "N-UP FIXED", COL_DIM, COL_BG, false, 1);
+}
+
+static void render_radar(void) {
+    render_header("C-RID  RADAR", COL_GREEN);
+    panel_rect(0, HDR_H, PANEL_W, PANEL_H - HDR_H, COL_BG);
+    radar_dial();
+    memset(s_radar_blips, 0, sizeof(s_radar_blips));
+    for (unsigned i = 0; i < sizeof(s_radar_info) / sizeof(s_radar_info[0]); i++)
+        s_radar_info[i].text[0] = '\0';
+    radar_refresh();
+    panel_text(8, 230, "M+LR: target   B/M: range   LR: page", COL_DIM, COL_BG, false, 1);
+}
+
 static void render(void) {
     panel_fill(COL_BG);   /* 只在切页 / 进入退出编辑时调用 */
     switch (s_page) {
@@ -795,8 +1067,9 @@ static void render(void) {
                 render_targets_page();
             }
             break;
-        case 2: render_about(); break;
-        case 3: render_config(); break;
+        case 2: render_radar(); break;
+        case 3: render_about(); break;
+        case 4: render_config(); break;
         default: render_status(); break;
     }
 }
@@ -819,6 +1092,7 @@ static void lcd_task(void *arg) {
         int64_t now = esp_timer_get_time();
         bool layout_changed = false;   /* 触发整页重画 */
         bool config_local = false;     /* 配置页局部重画 */
+        bool radar_local = false;      /* 雷达页局部重画 */
 
         /* B + M 同时长按 1.5 秒返回开机菜单。已按用户要求取消 R 单独长按回菜单。 */
         bool bm = buttons_down(UI_BTN_BAND) && buttons_down(UI_BTN_MODE);
@@ -839,7 +1113,7 @@ static void lcd_task(void *arg) {
         bool bdown = buttons_down(UI_BTN_BAND);
         if (bdown && !bm) {
             if (!b_hold_us) b_hold_us = now;
-            if (!b_long_fired && now - b_hold_us >= 1000000 && s_page == 3 && s_edit_item >= 0) {
+            if (!b_long_fired && now - b_hold_us >= 1000000 && s_page == 4 && s_edit_item >= 0) {
                 s_editing = !s_editing;                   /* 编辑完态 <-> 改值态 */
                 b_long_fired = true;
                 layout_changed = true;
@@ -880,18 +1154,20 @@ static void lcd_task(void *arg) {
             panel_backlight(s_bright);
             buzzer_play(UI_BUZZ_MODE);
             /* 关于页会显示 LIGHT 档位：正在看那页就立刻刷这一行，其它页不用动屏 */
-            if (s_page == 2 && s_edit_item < 0) refresh_about_live();
+            if (s_page == 3 && s_edit_item < 0) refresh_about_live();
             layout_sig_sync();
         }
-        /* 修饰键 + 方向键 = 翻航迹（目标页）。dir_mod 1 是 BAND 位、2 是 MODE 位，
-         * 目标页上两者没有别的用途，所以都接受，避免按键命名和实物不符时失效。 */
-        else if (dir && (ev.dir_mod == 1 || ev.dir_mod == 2) && s_page == 1) {
+        /* 修饰键 + 方向键 = 翻目标（目标页 / 雷达页共用同一个选中项）。dir_mod 1 是
+         * BAND 位、2 是 MODE 位，两页上都没有别的用途，所以都接受，避免按键命名
+         * 和实物不符时失效。 */
+        else if (dir && (ev.dir_mod == 1 || ev.dir_mod == 2) && (s_page == 1 || s_page == 2)) {
             int n = crid_rx_get_tracks(s_tracks);
             if (n > 0) {
                 s_target = (unsigned)(((int)s_target + step + n) % n);
-                if (s_detail) layout_changed = true;   /* 详情页：整页换一条 */
-                else          render_targets_page();   /* 列表：整块换一批，仅按键时发生 */
-                s_slots_drawn = -1;                    /* 强制下次周期重新核对槽位数 */
+                if (s_page == 2)      radar_local = true;   /* 雷达：换高亮目标 */
+                else if (s_detail)    layout_changed = true; /* 详情页：整页换一条 */
+                else                  render_targets_page(); /* 列表：整块换一批 */
+                s_slots_drawn = -1;                          /* 强制下次周期重新核对槽位数 */
             }
             layout_sig_sync();
         }
@@ -919,11 +1195,12 @@ static void lcd_task(void *arg) {
                 /* 编辑完态·数值项：←/→ 直接改数值 */
                 cfg_change((unsigned)s_edit_item, step);
                 config_local = true;
-            } else if (s_page == 3) {
+            } else if (s_page == 4) {
                 s_cfg_cursor = (unsigned)((s_cfg_cursor + (step > 0 ? 1 : CFG_COUNT - 1)) % CFG_COUNT);
                 config_local = true;
             } else {
-                s_page = (uint8_t)((s_page + (step > 0 ? 1 : 3)) % 4);
+                /* 顺序：状态 → 目标 → 雷达 → 关于 → 配置 */
+                s_page = (uint8_t)((s_page + (step > 0 ? 1 : 4)) % 5);
                 layout_changed = true;
             }
         }
@@ -943,7 +1220,12 @@ static void lcd_task(void *arg) {
                     layout_changed = true;
                 }
                 buzzer_play(UI_BUZZ_CHANNEL);
-            } else if (s_page == 3) {
+            } else if (s_page == 2) {
+                /* 雷达页：B/M 循环切换量程（自动 → 200m → … → 5km），并记住档位 */
+                radar_rng_next();
+                radar_local = true;
+                buzzer_play(UI_BUZZ_CHANNEL);
+            } else if (s_page == 4) {
                 if (s_edit_item >= 0 && s_editing) {
                     /* 改值态点按 B：字符串项把光标移到下一字符 */
                     if (cfg_is_string((unsigned)s_edit_item)) {
@@ -978,7 +1260,11 @@ static void lcd_task(void *arg) {
                     layout_changed = true;
                 }
                 buzzer_play(UI_BUZZ_CHANNEL);
-            } else if (s_page == 3) {
+            } else if (s_page == 2) {
+                radar_rng_next();
+                radar_local = true;
+                buzzer_play(UI_BUZZ_CHANNEL);
+            } else if (s_page == 4) {
                 if (s_edit_item >= 0 && s_editing) {
                     /* 改值态按 M = 完成本项，退回编辑完态（不保存）。
                      * 编辑完态里又是：点按 B 下一项、长按 B 1s 进改值。 */
@@ -1010,6 +1296,8 @@ static void lcd_task(void *arg) {
                 rows_refresh();
             }
             layout_sig_sync();
+        } else if (radar_local) {
+            radar_refresh();                          /* 量程/高亮变化：只刷雷达动态部分 */
         }
 
         /* 周期检查：只做局部刷新。
@@ -1026,10 +1314,13 @@ static void lcd_task(void *arg) {
                 last_paint = now;
                 if (s_detail) refresh_detail_live();
                 else          refresh_targets_live();
+            } else if (s_page == 2 && now - last_paint >= 1000000) {
+                last_paint = now;
+                radar_refresh();          /* 雷达：每秒只动变化的光点与信息行 */
             } else if (s_page == 0 && now - last_paint >= 500000) {
                 last_paint = now;
                 refresh_status_live();
-            } else if (s_page == 2 && now - last_paint >= 1000000) {
+            } else if (s_page == 3 && now - last_paint >= 1000000) {
                 last_paint = now;
                 refresh_about_live();
             }
@@ -1054,6 +1345,9 @@ void crid_lcd_start(cn_crid_config_t *config) {
     /* 恢复上次的蜂鸣器静音状态，让开机延续关机前的选择。 */
     s_muted = lcd_mute_load();
     buzzer_enable(!s_muted);
+
+    /* 恢复上次的雷达量程档位（0=自动）；从未设置过就是自动。 */
+    s_radar_rng = radar_rng_load();
 
     memcpy(&s_edit, s_cfg, sizeof(s_edit));
     render();
