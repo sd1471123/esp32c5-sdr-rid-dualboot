@@ -2,12 +2,12 @@
 
 ## 实物图
 
-手搓实机拍摄的照片（模拟渲染图见下面「界面预览」），因为是设计验证，背面都是飞线比较乱就不展示了：
+手搓实机拍摄的照片（模拟渲染图见下面「界面预览」）：
 
-| 手持成品 | 裸板 |
-|---|---|
-| <img src="docs/photos/device-handheld.png" width="280" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-board.png" width="420" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
-| 3D打印外壳 + 双频天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | ESP32-C5 + 3.2" ST7789 + 5 个按键，背后是主控板，转3.3V模块负责给主控板和屏幕供电，转5V充放电一体模块可给其他设备充电，配5000毫安21700电池 |
+| 手持成品（正面） | 手持背面 | 裸板 |
+|---|---|---|
+| <img src="docs/photos/device-handheld.png" width="260" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-handheld-back.png" width="220" alt="手持成品背面，3D 打印外壳、天线与充放电模块"> | <img src="docs/photos/device-board.png" width="380" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
+| 3D打印外壳 + 双频天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | 背面：充放电一体模块、21700 电池仓与 SMA 天线座，红点为充电指示 | ESP32-C5 + 3.2" ST7789 + 5 个按键，背后是主控板，转3.3V模块负责给主控板和屏幕供电，转5V充放电一体模块可给其他设备充电，配5000毫安21700电池 |
 
 **硬件**：ESP32-C5（16 MB Flash）· 3.2" ST7789 240×320 SPI 屏（横屏使用）· 5 个按键 · 蜂鸣器
 
