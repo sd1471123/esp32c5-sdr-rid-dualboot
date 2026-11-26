@@ -46,7 +46,7 @@
 
 ## 界面预览
 
-![十个页面总览](docs/screens/overview.png)
+![九个页面总览](docs/screens/overview.png)
 
 上面是**模拟渲染**图，不是相机拍屏：像素由固件自己的字库（`font5x7` / `font7x12`）和页面里写死的坐标逐个画出来，所以字号、行距、每行能塞多少字、灰阶配色都与实物一致，只是没有 IPS 视角、背光溢出这类光学效果。这样也方便改了 UI 之后重新出图对照。
 
@@ -61,7 +61,7 @@
 | C-RID 接收目标列表 | [`05-rid-targets.png`](docs/screens/05-rid-targets.png) |
 | C-RID 雷达页（同心圈 + 方位打点 + 自动量程） | [`10-rid-radar.png`](docs/screens/10-rid-radar.png) |
 | 目标详情（12 行字段，只刷数值） | [`06-rid-detail.png`](docs/screens/06-rid-detail.png) |
-| 配置列表 / 编辑项 | [`07-rid-config.png`](docs/screens/07-rid-config.png) · [`08-rid-edit.png`](docs/screens/08-rid-edit.png) |
+| 配置列表（编辑项从同页进入） | [`07-rid-config.png`](docs/screens/07-rid-config.png) |
 | 关于页（版本 / 分区 / 背光档位） | [`09-rid-about.png`](docs/screens/09-rid-about.png) |
 
 2.4G 和 5.8G 两张图能看出信道条的两种画法：2.4 GHz 信道间隔只有 5 MHz 但每个占 20 MHz，按频率画会互相压成一团，所以固件改成 13 个等分格；5.8 GHz 信道本来就不重叠，就直接摆到频率轴上，RADAR / SAT / ISM 三段空隙自然露出来。

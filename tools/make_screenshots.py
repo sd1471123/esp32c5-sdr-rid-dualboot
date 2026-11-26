@@ -607,7 +607,6 @@ PAGES = [
     ("10-rid-radar", "C-RID RADAR", rid_radar),
     ("06-rid-detail", "TARGET DETAIL", rid_detail),
     ("07-rid-config", "CONFIG LIST", rid_config),
-    ("08-rid-edit", "EDIT CONFIG", rid_edit),
     ("09-rid-about", "ABOUT", rid_about),
 ]
 
