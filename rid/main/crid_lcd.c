@@ -790,7 +790,8 @@ static void render_config(void) {
 /* ---- 雷达页 ----
  * 设备没有陀螺仪/罗盘，所以方位固定「上北下南、右东左西」，不随设备转动。
  * 本机坐标从手机上报的 /api/selfpos 取（App 连蓝牙自动报，或网页点「使用
- * 手机定位」）；坐标只在 RAM 中，超过 30 秒未更新按过期处理。
+ * 手机定位」）；坐标只在 RAM 中，超过 30 秒未更新只标记为「最后的定位」，
+ * 仍然按最后坐标继续绘制，手机断开后雷达不会突然清空。
  *
  * 屏上分三块：
  *   - 静态表盘：4 圈同心圆 + 十字线 + 方位字，只在进页时画一次；
@@ -874,6 +875,8 @@ static void radar_info_line(unsigned slot, unsigned y, uint16_t color, const cha
 static void radar_refresh(void) {
     crid_selfpos_t sp;
     bool has_sp = crid_web_selfpos_get(&sp);
+    /* fresh 只影响右侧「GPS OK / GPS LAST」提示；只要有坐标就继续画，
+     * 手机断开后沿用最后一次定位，雷达不会清空。 */
     bool fresh = has_sp && sp.age_ms <= RADAR_STALE_MS;
 
     int n = crid_rx_get_tracks(s_tracks);
@@ -882,18 +885,19 @@ static void radar_refresh(void) {
     if (n > 0 && s_target >= (unsigned)n) s_target = 0;
 
     int online = 0, nopos = 0;
-    float de[CRID_RX_MAX_TRACKS], dn[CRID_RX_MAX_TRACKS];
+    float de[CRID_RX_MAX_TRACKS] = { 0 }, dn[CRID_RX_MAX_TRACKS] = { 0 };
     bool  pv[CRID_RX_MAX_TRACKS] = { false };
+    bool  approx[CRID_RX_MAX_TRACKS] = { false };   /* 还没有本机定位：只画在中心附近 */
     float maxd = 0;
 
     double kx = 0;
-    if (fresh) kx = 111320.0 * cos(sp.latitude * 0.0174532925199433);
+    if (has_sp) kx = 111320.0 * cos(sp.latitude * 0.0174532925199433);
     for (int i = 0; i < n; i++) {
         const crid_rx_track_t *t = &s_tracks[i];
         if (t->active) online++;
         bool has_ll = !(t->latitude == 0.0 && t->longitude == 0.0);
         if (!has_ll) { nopos++; continue; }
-        if (!fresh) continue;
+        if (!has_sp) { pv[i] = true; approx[i] = true; continue; }
         de[i] = (float)((t->longitude - sp.longitude) * kx);
         dn[i] = (float)((t->latitude - sp.latitude) * 110540.0);
         pv[i] = true;
@@ -930,11 +934,16 @@ static void radar_refresh(void) {
 
     if (!has_sp) {
         radar_info_line(1, 48, COL_RED, "NO SELF POS");
-        radar_info_line(2, 62, COL_DIM, "Phone GPS not set");
+        radar_info_line(2, 62, COL_DIM, "Blips near center");
     } else if (!fresh) {
-        snprintf(line, sizeof(line), "GPS STALE %us", (unsigned)(sp.age_ms / 1000));
+        unsigned s = (unsigned)(sp.age_ms / 1000);
+        if (s < 60)
+            snprintf(line, sizeof(line), "GPS LAST %us", s);
+        else
+            snprintf(line, sizeof(line), "GPS LAST %um", s / 60);
         radar_info_line(1, 48, COL_AMBER, line);
-        radar_info_line(2, 62, COL_DIM, "Phone GPS stale");
+        snprintf(line, sizeof(line), "%.5f,%.5f", sp.latitude, sp.longitude);
+        radar_info_line(2, 62, COL_DIM, line);
     } else {
         snprintf(line, sizeof(line), "GPS OK ~%.0fm", (double)sp.accuracy_m);
         radar_info_line(1, 48, COL_GREEN, line);
@@ -950,7 +959,7 @@ static void radar_refresh(void) {
         snprintf(line, sizeof(line), "%.18s",
                  t->drone_name[0] ? t->drone_name : (t->uas_id[0] ? t->uas_id : "--"));
         radar_info_line(4, 106, COL_AMBER, line);
-        if (pv[s_target]) {
+        if (pv[s_target] && !approx[s_target]) {
             float d = sqrtf(de[s_target] * de[s_target] + dn[s_target] * dn[s_target]);
             float brg = atan2f(de[s_target], dn[s_target]) * 57.29578f;
             if (brg < 0) brg += 360.0f;
@@ -982,20 +991,29 @@ static void radar_refresh(void) {
 
     for (int i = 0; i < CRID_RX_MAX_TRACKS; i++) {
         radar_blip_t *b = &s_radar_blips[i];
-        bool want = fresh && i < n && pv[i];
+        bool want = i < n && pv[i];
         if (!want) {
             if (b->drawn) radar_blip_erase(b);
             continue;
         }
-        float d = sqrtf(de[i] * de[i] + dn[i] * dn[i]);
-        float sx = de[i] * (float)RADAR_R / (float)range;
-        float sy = dn[i] * (float)RADAR_R / (float)range;
-        if (d > (float)range && d > 0) {          /* 手动量程装不下时贴到圆环上 */
-            sx = de[i] / d * (float)RADAR_R;
-            sy = dn[i] / d * (float)RADAR_R;
+        int x, y;
+        if (approx[i]) {
+            /* 还没有本机坐标：8 个固定槽位围绕中心，避免所有点叠成一团。
+             * 不用随机方位——随机点会让人误以为测到了真实方向。 */
+            float rad = (float)(i * 45) * 0.0174532925f;
+            x = RADAR_CX + RADAR_IRND(cosf(rad) * 14.0f);
+            y = RADAR_CY - RADAR_IRND(sinf(rad) * 14.0f);
+        } else {
+            float d = sqrtf(de[i] * de[i] + dn[i] * dn[i]);
+            float sx = de[i] * (float)RADAR_R / (float)range;
+            float sy = dn[i] * (float)RADAR_R / (float)range;
+            if (d > (float)range && d > 0) {          /* 手动量程装不下时贴到圆环上 */
+                sx = de[i] / d * (float)RADAR_R;
+                sy = dn[i] / d * (float)RADAR_R;
+            }
+            x = RADAR_CX + RADAR_IRND(sx);
+            y = RADAR_CY - RADAR_IRND(sy);
         }
-        int x = RADAR_CX + RADAR_IRND(sx);
-        int y = RADAR_CY - RADAR_IRND(sy);
         int sz = (i == (int)s_target) ? 7 : 5;
         uint16_t col = !s_tracks[i].active ? COL_DIM
                        : (i == (int)s_target ? COL_AMBER : COL_GREEN);
