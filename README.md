@@ -17,7 +17,7 @@
 
 | 器件 | 型号 / 说明 | 价格 | 图片 |
 |---|---|---|---|
-| 主控板 | ESP32-C5 开发板（DZQJ旗舰店），16 MB Flash，双 USB-C，板载 WS2812 状态灯，BOOT 键即 GPIO28 | ¥35 | <img src="docs/photos/esp32-c5-board.png" width="260" alt="DZQJ ESP32-C5 开发板"> |
+| 主控板 | ESP32-C5 开发板（DZQJ旗舰店），16 MB Flash，双 USB-C，板载 WS2812 状态灯，BOOT 键即 GPIO28，连接设备使用右边的高速USB口 | ¥35 | <img src="docs/photos/esp32-c5-board.png" width="260" alt="DZQJ ESP32-C5 开发板"> |
 | 显示屏 | 三创优视 3.2" TFT，240×320，ST7789 驱动，SPI 接口，彩色 8 针显示模组 | ¥30 | <img src="docs/photos/tft-3.2-st7789.png" width="300" alt="三创优视 3.2 寸 ST7789 SPI 8 针 TFT 模组"> |
 
 其余件：5 个轻触按键、无源蜂鸣器、3D 打印外壳、2.4/5.8 GHz 双频天线、SMA 座、21700 电池与 5V 充放电一体模块，见上方「实物图」。
