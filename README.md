@@ -9,7 +9,34 @@
 | <img src="docs/photos/device-handheld.png" width="260" alt="手持成品，屏幕显示 5.8 GHz 频谱"> | <img src="docs/photos/device-handheld-back.png" width="220" alt="手持成品背面，3D 打印外壳、天线与充放电模块"> | <img src="docs/photos/device-board.png" width="380" alt="裸板，ESP32-C5 + ST7789 屏 + 5 个按键"> |
 | 3D打印外壳 + 双频天线，屏幕跑 SDR 频谱（ch120 / 5600 MHz） | 背面：内部充放电一体模块、21700 电池仓与 SMA 天线座，esp32模块支持直接GPIO接口拔插更换 | ESP32-C5 + 3.2" ST7789 + 5 个按键，背后是主控板，转3.3V模块负责给主控板和屏幕供电，转5V充放电一体模块可给其他设备充电，配5000毫安21700电池 |
 
-**硬件**：ESP32-C5（16 MB Flash）· 3.2" ST7789 240×320 SPI 屏（横屏使用）· 5 个按键 · 蜂鸣器
+**硬件**：DZQJ ESP32-C5 开发板（16 MB Flash，板载 WS2812）· 三创优视 3.2" ST7789 240×320 SPI 屏（横屏使用）· 5 个按键 · 蜂鸣器
+
+## 物料清单
+
+整机是手搓的，两块核心件都来自淘宝现货，价格是购买时的实付价，仅供参照：
+
+| 器件 | 型号 / 说明 | 价格 | 图片 |
+|---|---|---|---|
+| 主控板 | ESP32-C5 开发板（DZQJ旗舰店），16 MB Flash，双 USB-C，板载 WS2812 状态灯，BOOT 键即 GPIO28 | ¥35 | <img src="docs/photos/esp32-c5-board.png" width="260" alt="DZQJ ESP32-C5 开发板"> |
+| 显示屏 | 三创优视 3.2" TFT，240×320，ST7789 驱动，SPI 接口，彩色 8 针显示模组 | ¥30 | <img src="docs/photos/tft-3.2-st7789.png" width="300" alt="三创优视 3.2 寸 ST7789 SPI 8 针 TFT 模组"> |
+
+其余件：5 个轻触按键、无源蜂鸣器、3D 打印外壳、2.4/5.8 GHz 双频天线、SMA 座、21700 电池与 5V 充放电一体模块，见上方「实物图」。
+
+## 无屏幕也能切换固件（v0.0.4 新增）
+
+只拿一块 ESP32-C5 核心板、不接屏幕时，不用改代码，也不用连电脑：**开机 5 秒内**按板上的 **BOOT** 键即可选择要启动的固件，靠板载 RGB 灯看结果。
+
+| 操作 | 灯光反馈 | 结果 |
+|---|---|---|
+| 第 1 次按 BOOT | 红灯闪 2 次 | 选中 **SDR 频谱仪** |
+| 再按一次 | 蓝灯闪 2 次 | 选中 **C-RID 远程识别** |
+| 继续按 | 红 / 蓝交替 | 在两个固件之间切换 |
+| 最后一次按键后等 5 秒 | 灯灭 | 自动启动当前选中的固件 |
+
+- **BOOT 键**：GPIO28（低有效，内部上拉）；**RGB 灯**：GPIO27 的 WS2812，由 RMT 驱动
+- **带屏设备不受影响**：不按 BOOT 就一直停在原来的双固件菜单，5 个按键逻辑完全不变
+- **回菜单**：断电重开即可（两个固件启动时都会把 otadata 清回 launcher）
+- 注意：BOOT 要在**通电之后**按；在复位瞬间按住会被 ROM 当成下载模式
 
 把两个项目合成**一个可烧录的 16 MB 镜像**，开机用同一块 ST7789 屏和 5 个按键选择进入哪套固件：
 
@@ -205,7 +232,7 @@ C-RID 的网页配置入口（`https://192.168.4.1`）和 BLE 数据通道完全
 
 ```bash
 python -m esptool --chip esp32c5 -p COM5 -b 460800 \
-    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.0.3-full-16mb.bin
+    write_flash 0x0 esp32c5-sdr-rid-dualboot-v0.0.4-full-16mb.bin
 ```
 
 同一页的 `...-parts.zip` 里是分体 bin 和一张 `FLASH.txt` 地址表，只想更新 C-RID 或想保留 NVS 设置时用；`SHA256SUMS.txt` 是校验和。
@@ -217,7 +244,7 @@ python -m esptool --chip esp32c5 -p COM5 -b 460800 \
 # Git Bash：先设好 IDF_PATH / IDF_PYTHON_ENV_PATH，或先 source ESP-IDF 的 export.sh
 bash tools/build_all.sh
 bash tools/flash_all.sh -p COM6          # 整片烧录，会清 NVS
-python tools/package_release.py --version v0.0.3   # 出发布包：整片镜像 + 分体 zip + 校验和
+python tools/package_release.py --version v0.0.4   # 出发布包：整片镜像 + 分体 zip + 校验和
 ```
 
 PowerShell：
@@ -267,6 +294,14 @@ RID `0x1b64e0` 字节（加雷达页后增大）。RID 构建末尾会出现一�
 - 根目录 CMake 增加 `../common/panel` 与 `../common/dualboot` 组件。
 
 ## 版本历史
+
+### v0.0.4 — 无屏 BOOT 键切换 + 物料说明
+
+- **无屏切换**：不接屏幕的核心板，开机 5 秒内按板载 BOOT（GPIO28）进入无屏选择；每按一次在 SDR / C-RID 之间切换，板载 WS2812（GPIO27）红 / 蓝闪 2 次提示；最后一次按键 5 秒后自动启动。
+- **兼容带屏设备**：不按 BOOT 仍停在双固件菜单，原 5 键逻辑不变；实测复位后连续 12 秒无操作不会误触发。
+- **状态灯驱动**：launcher 新增 RMT 驱动的 WS2812 控制（`launcher/main/status_led.c`），与 SDR 固件里的实现同源。
+- **文档**：README 新增物料清单（DZQJ ESP32-C5 开发板 ¥35、三创优视 3.2" ST7789 SPI 屏 ¥30）和无屏使用说明。
+- **兼容性**：分区表、BLE 帧、NVS 命名空间均未变；已有设备只需更新 `0x20000` 的 launcher。
 
 ### v0.0.3 — 本地 TFT 雷达页 + 手机定位
 
