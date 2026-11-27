@@ -351,3 +351,13 @@ MIT 的 `rid/` 代码可以并入 GPL-3.0 的组合作品，方向是兼容的�
 
 上游各文件的版权头一律保留未改。如果你把本项目再分发或二次开发，请同样遵守 GPL-3.0
 （提供对应源码、保留声明、衍生作品同样开源）。
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=sd1471123%2Fesp32c5-sdr-rid-dualboot&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=sd1471123/esp32c5-sdr-rid-dualboot&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=sd1471123/esp32c5-sdr-rid-dualboot&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=sd1471123/esp32c5-sdr-rid-dualboot&type=date&legend=top-left" />
+ </picture>
+</a>
